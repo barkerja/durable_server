@@ -186,8 +186,23 @@ See `DurableServer.Backends.MirrorStore` for usage and an example rollout.
 
 Wrap any backend with `DurableServer.Backends.EncryptedStore` to encrypt state
 before it reaches the underlying store. Encryption uses a fresh content key per
-object and supports multiple X25519 recipients, following the envelope model
-used by `superfly/ltx`.
+object and supports up to 32 X25519 recipients, following the envelope model
+used by `superfly/ltx`. The encrypted store seals a canonical, backend-agnostic
+encoding of the exact term you store — atom keys, pids, and references all
+survive unchanged no matter which backend it wraps — and never asks the
+wrapped backend to interpret that plaintext; only the sealed envelope
+(ciphertext, wrapped per-recipient keys, nonce, and tag) reaches the wrapped
+backend's own codec. The one exception is an object written before encryption
+was enabled: it is read through the wrapped backend's own codec exactly as if
+this wrapper were absent, and gains the same fidelity guarantee the next time
+it's written.
+
+Both the write and the read path bound the encoded payload at 16 MiB
+(16,777,216 bytes), enforced from the same constant so the two sides cannot
+drift apart. A write larger than the bound fails immediately with
+`{:error, {:payload_too_large, size}}` instead of succeeding and leaving
+behind an object nothing can ever read back; a read rejects anything over the
+bound, or anything claiming ETF compression, before attempting to decode it.
 
 Generate a key pair once and store the private key in your secret manager:
 
@@ -223,13 +238,66 @@ children = [
 ]
 ```
 
-Existing plaintext objects remain readable. They are encrypted when they are
-next written. To rotate keys without downtime, first write to both the old and
-new public keys while retaining the old private key; after existing objects
-have been rewritten, deploy the new private key and remove the old recipient.
+Existing plaintext objects remain readable by default
+(`plaintext_compat: :permissive`, the default) and are encrypted the next time
+they are written. Permissive mode means anything with write access to the
+wrapped backend can inject an unmarked object and have it accepted with no
+cryptographic check; every such read is logged with `Logger.warning/1` so the
+exposure is observable — there is no accompanying `:telemetry` event, since
+`:telemetry` is only a transitive dependency here, not one this library
+declares. Pass `plaintext_compat: :strict` once a deployment no longer needs
+to read pre-encryption data — reads of an unmarked object then fail with
+`{:error, :plaintext_rejected}` instead of being returned.
+
+If you let the supervisor manage the EKV process directly — passing
+`data_dir`/`cluster_size`/`node_id` to `DurableServer.Backends.EKVStore`
+instead of starting your own `EKV` — wrapping that spec in `EncryptedStore`
+also derives an encrypted heartbeat store automatically when you don't supply
+one, using an `EKVStore` under a `heartbeats/` subdirectory of the same
+`data_dir`. The derived store always carries forward the primary store's
+`recipient_public_keys`, `decryption_key`, and `plaintext_compat`, so a
+primary store configured `:strict` cannot end up with a silently
+`:permissive` heartbeat store.
 
 The storage key is authenticated with the ciphertext, so moving an encrypted
 value to a different key causes decryption to fail.
+
+### Rotating Keys
+
+Rotation changes two independent things — the recipient set and which private
+key this deployment holds — and they must be rolled out as separate,
+fleet-wide steps. Changing the decryption key and shrinking the recipient set
+in the same deploy means a mid-rollout node running the new config writes
+objects that a node still on the old config cannot decrypt; those objects
+also disappear entirely from `list_all_objects_stream` for the old-config
+node, since it cannot even decode their metadata.
+
+1. **Add the new recipient, fleet-wide.** Deploy
+   `recipient_public_keys: [old_pub, new_pub]` with `decryption_key: old_priv`
+   to every node. Every node can still decrypt with the old key. Writing an
+   object — any `put_object`/`update_object` — is what re-encrypts it for the
+   new recipient; reading one never does. Rewrite or backfill the objects you
+   want protected under the new key, then verify the fleet is healthy on this
+   config before continuing.
+2. **Switch the decryption key, fleet-wide.** Deploy the same
+   `recipient_public_keys: [old_pub, new_pub]` (unchanged) with
+   `decryption_key: new_priv` to every node. Every node can now decrypt
+   objects sealed for either recipient, so this is safe regardless of which
+   objects were rewritten in step 1.
+3. **Drop the old recipient.** Only once every node is confirmed running step
+   2's config, deploy `recipient_public_keys: [new_pub]`. Any object still
+   sealed only for `old_pub` (because it was never rewritten) becomes
+   unrecoverable at this point.
+
+A decryption-key change and a recipient-set shrink must never land in the
+same deploy — that is the two-step version of this procedure, and it is
+unsafe.
+
+Rotation does not complete on its own. Nothing here re-encrypts objects your
+application never rewrites, and no tooling ships to force a rewrite of
+everything under a prefix. If your workload doesn't naturally touch every
+object, step 1 requires you to write your own backfill (read and rewrite each
+key, for example via `list_all_objects_stream`) before step 3 is safe.
 
 ## Configuration Options
 

@@ -70,6 +70,54 @@ defmodule DurableServer.EncryptionTest do
              |> Encryption.open(private_key, "")
   end
 
+  test "reports the failing recipient index for a genuine HPKE seal failure, not just a length check" do
+    {ok_public_key, _ok_private_key} = Encryption.generate_key_pair()
+
+    # All-zero is a valid-length X25519 key but a low-order curve point, so it
+    # passes validate_recipient_keys' format check and fails inside seal_cek's
+    # HPKE seal instead -- placed at index 1 so a hardcoded 0 would not pass.
+    invalid_public_key = <<0::256>>
+
+    assert {:error, {:invalid_recipient_public_key, 1}} =
+             Encryption.seal("secret", [ok_public_key, invalid_public_key], "server/123")
+  end
+
+  test "produces a fresh nonce, ciphertext, and recipient wrap on repeated seals" do
+    {public_key, _private_key} = Encryption.generate_key_pair()
+
+    assert {:ok, envelope1} = Encryption.seal("secret", [public_key], "server/123")
+    assert {:ok, envelope2} = Encryption.seal("secret", [public_key], "server/123")
+
+    assert envelope1["nonce"] != envelope2["nonce"]
+    assert envelope1["ciphertext"] != envelope2["ciphertext"]
+    assert envelope1["recipients"] != envelope2["recipients"]
+  end
+
+  test "rejects sealing for more recipients than the configured cap" do
+    public_keys = for _ <- 1..33, do: elem(Encryption.generate_key_pair(), 0)
+
+    assert {:error, :too_many_recipients} = Encryption.seal("secret", public_keys, "")
+  end
+
+  test "rejects an envelope claiming more recipients than the cap before any trial decryption" do
+    {_public_key, private_key} = Encryption.generate_key_pair()
+
+    oversized_entry = Base.url_encode64(:crypto.strong_rand_bytes(80), padding: false)
+
+    envelope = %{
+      "__durable_server_encrypted__" => 1,
+      "kem" => 0x0020,
+      "kdf" => 0x0001,
+      "aead" => 0x0003,
+      "recipients" => List.duplicate(oversized_entry, 33),
+      "nonce" => Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false),
+      "ciphertext" => Base.url_encode64(<<0>>, padding: false),
+      "tag" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    assert {:error, :too_many_recipients} = Encryption.open(envelope, private_key, "")
+  end
+
   test "opens an HPKE recipient entry produced by superfly/ltx" do
     private_key =
       hex!("9803a596185df6e8097d620cd4e03c02f787b49f07333c5846d703da71199254")

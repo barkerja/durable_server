@@ -964,8 +964,12 @@ defmodule DurableServer.Supervisor do
       {:ok, %{body: body, etag: etag}} ->
         {:ok, preloaded_boot_info(body, etag)}
 
-      {:error, _} ->
+      {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to check existing state for #{storage_key}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -2198,137 +2202,154 @@ defmodule DurableServer.Supervisor do
 
         existing = Keyword.get(opts, :existing, false)
 
-        {stored_object, sticky_placement} =
-          case StorageBackend.get_object(
+        with {:ok, {stored_object, sticky_placement}} <-
+               ensure_started_stored_object(
                  config.storage_backend,
                  storage_key,
-                 consistent: existing
+                 existing,
+                 supervisor,
+                 module,
+                 key
                ) do
-            {:ok, %{body: body, etag: etag}} ->
-              # Get augmented sticky placement (handles module config updates like :any)
-              augmented_placement =
-                __get_augmented_sticky_placement__(supervisor, module, key, body)
+          if existing and stored_object == nil do
+            {:error, :not_found}
+          else
+            # Check if we should respect sticky placement and skip local start
+            # Also track matching_level for time-gated fallback when remote placement fails
+            # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
+            # When local_only: true, never skip local — ignore sticky placement preferences
+            {should_skip_local, is_sticky_local, matching_level} =
+              if local_only do
+                {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
+              else
+                case sticky_placement do
+                  nil ->
+                    # No sticky placement, proceed with normal local-first logic
+                    {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
 
-              {{:ok, %{body: body, etag: etag}}, augmented_placement}
+                  [%{env_var: :any, value: :any} | _] ->
+                    # First level is :any, so local node is acceptable but we don't know
+                    # if data is specifically here (could have been on any node)
+                    {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
 
-            {:error, _} ->
-              {nil, nil}
-          end
+                  placement ->
+                    # Have specific sticky placement (first element is not :any)
+                    # Check if local node matches
+                    env_var_names =
+                      DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
 
-        if existing and stored_object == nil do
-          {:error, :not_found}
-        else
-          # Check if we should respect sticky placement and skip local start
-          # Also track matching_level for time-gated fallback when remote placement fails
-          # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
-          # When local_only: true, never skip local — ignore sticky placement preferences
-          {should_skip_local, is_sticky_local, matching_level} =
-            if local_only do
-              {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
-            else
-              case sticky_placement do
+                    my_env_vars =
+                      env_var_names
+                      |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+                      |> Enum.into(%{})
+
+                    # Check if we match any level (0 = exact, 1 = less specific, etc.)
+                    my_matching_level =
+                      Enum.find_index(placement, fn preference ->
+                        case preference do
+                          %{env_var: :any, value: :any} ->
+                            true
+
+                          %{env_var: env_var, value: expected_value} ->
+                            Map.get(my_env_vars, env_var) == expected_value
+
+                          _ ->
+                            false
+                        end
+                      end)
+
+                    # Skip local start only if we don't match level 0 (exact match)
+                    # This ensures servers stay on their sticky placement node for specific matches
+                    if my_matching_level == 0 do
+                      # Level 0 match with specific env var - use local, bypass disk check
+                      # (we know it's specific because :any at level 0 is handled above)
+                      {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
+                    else
+                      # Level > 0 match or nil (no match) - skip local to try remote first
+                      {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
+                    end
+                end
+              end
+
+            child_spec_with_boot_info =
+              case stored_object do
+                {:ok, %{body: body, etag: etag}} ->
+                  {module, init_arg,
+                   preloaded_boot_info(body, etag, is_sticky_local: is_sticky_local)}
+
                 nil ->
-                  # No sticky placement, proceed with normal local-first logic
-                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
-
-                [%{env_var: :any, value: :any} | _] ->
-                  # First level is :any, so local node is acceptable but we don't know
-                  # if data is specifically here (could have been on any node)
-                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
-
-                placement ->
-                  # Have specific sticky placement (first element is not :any)
-                  # Check if local node matches
-                  env_var_names =
-                    DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
-
-                  my_env_vars =
-                    env_var_names
-                    |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
-                    |> Enum.into(%{})
-
-                  # Check if we match any level (0 = exact, 1 = less specific, etc.)
-                  my_matching_level =
-                    Enum.find_index(placement, fn preference ->
-                      case preference do
-                        %{env_var: :any, value: :any} ->
-                          true
-
-                        %{env_var: env_var, value: expected_value} ->
-                          Map.get(my_env_vars, env_var) == expected_value
-
-                        _ ->
-                          false
-                      end
-                    end)
-
-                  # Skip local start only if we don't match level 0 (exact match)
-                  # This ensures servers stay on their sticky placement node for specific matches
-                  if my_matching_level == 0 do
-                    # Level 0 match with specific env var - use local, bypass disk check
-                    # (we know it's specific because :any at level 0 is handled above)
-                    {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
-                  else
-                    # Level > 0 match or nil (no match) - skip local to try remote first
-                    {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
-                  end
+                  child_spec
               end
+
+            # If we should skip local due to sticky placement, go straight to remote placement
+            cond do
+              should_skip_local ->
+                Logger.info(
+                  "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
+                )
+
+                await_sticky_placement(
+                  supervisor,
+                  module,
+                  key,
+                  stored_object,
+                  child_spec_with_boot_info,
+                  matching_level,
+                  placement_deadline_ms
+                )
+
+              true ->
+                # Normal flow: try local first, then remote if capacity exceeded
+                start_opts =
+                  opts
+                  |> Keyword.delete(:existing)
+                  |> Keyword.put_new(:placement_timeout, nil)
+                  |> Keyword.put(:timeout, timeout_option(deadline_ms))
+
+                case __start_child__(
+                       supervisor,
+                       child_spec_with_boot_info,
+                       start_opts
+                     ) do
+                  {:ok, {pid, meta}} ->
+                    {:ok, {pid, meta}}
+
+                  {:error, {:already_started, other}} ->
+                    normalize_already_started_result(supervisor, key, other, deadline_ms)
+
+                  :ignore ->
+                    :ignore
+
+                  {:error, reason} ->
+                    {:error, reason}
+                end
             end
-
-          child_spec_with_boot_info =
-            case stored_object do
-              {:ok, %{body: body, etag: etag}} ->
-                {module, init_arg,
-                 preloaded_boot_info(body, etag, is_sticky_local: is_sticky_local)}
-
-              nil ->
-                child_spec
-            end
-
-          # If we should skip local due to sticky placement, go straight to remote placement
-          cond do
-            should_skip_local ->
-              Logger.info(
-                "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
-              )
-
-              await_sticky_placement(
-                supervisor,
-                module,
-                key,
-                stored_object,
-                child_spec_with_boot_info,
-                matching_level,
-                placement_deadline_ms
-              )
-
-            true ->
-              # Normal flow: try local first, then remote if capacity exceeded
-              start_opts =
-                opts
-                |> Keyword.delete(:existing)
-                |> Keyword.put_new(:placement_timeout, nil)
-                |> Keyword.put(:timeout, timeout_option(deadline_ms))
-
-              case __start_child__(
-                     supervisor,
-                     child_spec_with_boot_info,
-                     start_opts
-                   ) do
-                {:ok, {pid, meta}} ->
-                  {:ok, {pid, meta}}
-
-                {:error, {:already_started, other}} ->
-                  normalize_already_started_result(supervisor, key, other, deadline_ms)
-
-                :ignore ->
-                  :ignore
-
-                {:error, reason} ->
-                  {:error, reason}
-              end
           end
         end
+    end
+  end
+
+  defp ensure_started_stored_object(
+         storage_backend,
+         storage_key,
+         existing,
+         supervisor,
+         module,
+         key
+       ) do
+    case StorageBackend.get_object(storage_backend, storage_key, consistent: existing) do
+      {:ok, %{body: body, etag: etag}} ->
+        # Get augmented sticky placement (handles module config updates like :any)
+        augmented_placement = __get_augmented_sticky_placement__(supervisor, module, key, body)
+
+        {:ok, {{:ok, %{body: body, etag: etag}}, augmented_placement}}
+
+      {:error, :not_found} ->
+        {:ok, {nil, nil}}
+
+      {:error, reason} ->
+        Logger.error("Failed to check stored object for #{storage_key}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -3876,6 +3897,27 @@ defmodule DurableServer.Supervisor do
     }
   end
 
+  defp init_backend_resource(
+         {DurableServer.Backends.EncryptedStore, raw_opts},
+         finch,
+         task_sup,
+         role
+       ) do
+    encryption_opts = normalize_backend_opts(raw_opts)
+    nested_spec = Keyword.fetch!(encryption_opts, :backend)
+    nested_resource = init_backend_resource(nested_spec, finch, task_sup, role)
+
+    backend_opts = Keyword.put(encryption_opts, :backend, nested_resource.backend)
+    backend = init_backend!(DurableServer.Backends.EncryptedStore, backend_opts)
+
+    %{
+      backend: backend,
+      managed_children: nested_resource.managed_children,
+      managed?: nested_resource.managed?,
+      managed_ekv_child_opts: nested_resource.managed_ekv_child_opts
+    }
+  end
+
   defp init_backend_resource(spec, finch, task_sup, _role) do
     %{
       backend: init_backend_spec(spec, finch, task_sup),
@@ -3915,6 +3957,61 @@ defmodule DurableServer.Supervisor do
 
         %{
           backend: init_backend!(DurableServer.Backends.EKVStore, heartbeat_backend_opts),
+          managed_children: [{state.ekv_mod, heartbeat_child_opts}],
+          managed?: true,
+          managed_ekv_child_opts: heartbeat_child_opts
+        }
+
+      :error ->
+        nil
+    end
+  end
+
+  defp maybe_auto_derive_heartbeat_backend(
+         %{
+           managed?: true,
+           backend: %StorageBackend{
+             adapter: DurableServer.Backends.EncryptedStore,
+             state:
+               %{backend: %StorageBackend{adapter: DurableServer.Backends.EKVStore, state: state}} =
+                 encrypted_state
+           },
+           managed_ekv_child_opts: managed_child_opts
+         },
+         _finch,
+         task_sup
+       )
+       when is_list(managed_child_opts) do
+    case Keyword.fetch(managed_child_opts, :data_dir) do
+      {:ok, data_dir} ->
+        base_name = Keyword.fetch!(managed_child_opts, :name)
+        heartbeat_name = :"#{base_name}_heartbeats"
+
+        heartbeat_child_opts =
+          managed_child_opts
+          |> Keyword.put(:name, heartbeat_name)
+          |> Keyword.put(:data_dir, Path.join(data_dir, "heartbeats"))
+          |> Keyword.put(:shards, 1)
+
+        heartbeat_ekv_opts =
+          state
+          |> Map.take(@ekv_backend_option_keys)
+          |> Map.to_list()
+          |> Keyword.put(:name, heartbeat_name)
+          |> Keyword.put_new(:task_supervisor, task_sup)
+
+        heartbeat_ekv_backend = init_backend!(DurableServer.Backends.EKVStore, heartbeat_ekv_opts)
+
+        heartbeat_backend =
+          init_backend!(DurableServer.Backends.EncryptedStore,
+            backend: heartbeat_ekv_backend,
+            recipient_public_keys: encrypted_state.recipient_public_keys,
+            decryption_key: encrypted_state.decryption_key,
+            plaintext_compat: encrypted_state.plaintext_compat
+          )
+
+        %{
+          backend: heartbeat_backend,
           managed_children: [{state.ekv_mod, heartbeat_child_opts}],
           managed?: true,
           managed_ekv_child_opts: heartbeat_child_opts
@@ -4037,8 +4134,9 @@ defmodule DurableServer.Supervisor do
       {:ok, %StorageBackend{} = backend} ->
         backend
 
-      {:error, _reason} ->
-        raise ArgumentError, "failed to initialize backend #{inspect(adapter)}"
+      {:error, reason} ->
+        raise ArgumentError,
+              "failed to initialize backend #{inspect(adapter)}: #{inspect(reason)}"
     end
   end
 
@@ -4054,13 +4152,6 @@ defmodule DurableServer.Supervisor do
          state: %ObjectStore{} = store
        }) do
     store
-  end
-
-  defp maybe_extract_object_store(%StorageBackend{
-         adapter: DurableServer.Backends.EncryptedStore,
-         state: %{backend: backend}
-       }) do
-    maybe_extract_object_store(backend)
   end
 
   defp maybe_extract_object_store(_), do: nil

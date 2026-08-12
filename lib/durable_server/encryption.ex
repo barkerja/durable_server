@@ -21,6 +21,7 @@ defmodule DurableServer.Encryption do
   @nonce_size 12
   @tag_size 16
   @recipient_entry_size 80
+  @max_recipients 32
   @hpke_version "HPKE-v1"
   @kem_suite_id <<"KEM", @kem_id::16>>
   @hpke_suite_id <<"HPKE", @kem_id::16, @kdf_id::16, @aead_id::16>>
@@ -82,7 +83,7 @@ defmodule DurableServer.Encryption do
        }}
     end
   rescue
-    error in ErlangError -> {:error, {:encryption_failed, error.original}}
+    error in ErlangError -> {:error, {:encryption_failed, rescued_reason(error)}}
   end
 
   @doc false
@@ -112,7 +113,7 @@ defmodule DurableServer.Encryption do
       {:error, _reason} = error -> error
     end
   rescue
-    error in ErlangError -> {:error, {:decryption_failed, error.original}}
+    error in ErlangError -> {:error, {:decryption_failed, rescued_reason(error)}}
   end
 
   def open(_envelope, _private_key, _context), do: {:error, :invalid_envelope}
@@ -120,7 +121,7 @@ defmodule DurableServer.Encryption do
   defp validate_recipient_keys([]), do: {:error, :recipient_public_keys_required}
 
   defp validate_recipient_keys(recipient_public_keys)
-       when length(recipient_public_keys) <= 65_535 do
+       when length(recipient_public_keys) <= @max_recipients do
     case Enum.find_index(recipient_public_keys, &(not valid_key?(&1))) do
       nil -> :ok
       index -> {:error, {:invalid_recipient_public_key, index}}
@@ -137,10 +138,11 @@ defmodule DurableServer.Encryption do
 
   defp seal_cek(cek, recipient_public_keys) do
     recipient_public_keys
-    |> Enum.reduce_while({:ok, []}, fn public_key, {:ok, entries} ->
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {public_key, index}, {:ok, entries} ->
       case hpke_seal(public_key, @cek_info, cek) do
         {:ok, entry} -> {:cont, {:ok, [entry | entries]}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:error, _reason} -> {:halt, {:error, {:invalid_recipient_public_key, index}}}
       end
     end)
     |> case do
@@ -150,8 +152,10 @@ defmodule DurableServer.Encryption do
   end
 
   defp open_cek(recipient_entries, private_key) do
+    {recipient_public_key, ^private_key} = :crypto.generate_key(:ecdh, :x25519, private_key)
+
     Enum.reduce_while(recipient_entries, {:error, :no_matching_recipient}, fn entry, _acc ->
-      case hpke_open(entry, private_key, @cek_info) do
+      case hpke_open(entry, private_key, recipient_public_key, @cek_info) do
         {:ok, cek} -> {:halt, {:ok, cek}}
         {:error, _reason} -> {:cont, {:error, :no_matching_recipient}}
       end
@@ -182,18 +186,16 @@ defmodule DurableServer.Encryption do
       {:ok, encapsulated_key <> ciphertext <> tag}
     end
   rescue
-    error in ErlangError -> {:error, {:hpke_seal_failed, error.original}}
+    error in ErlangError -> {:error, {:hpke_seal_failed, rescued_reason(error)}}
   end
 
   defp hpke_open(
          <<encapsulated_key::binary-size(@key_size), ciphertext::binary-size(@key_size),
            tag::binary-size(@tag_size)>>,
          recipient_private_key,
+         recipient_public_key,
          info
        ) do
-    {recipient_public_key, ^recipient_private_key} =
-      :crypto.generate_key(:ecdh, :x25519, recipient_private_key)
-
     with {:ok, shared_secret} <-
            dhkem_shared_secret(
              encapsulated_key,
@@ -218,10 +220,11 @@ defmodule DurableServer.Encryption do
       {:error, _reason} = error -> error
     end
   rescue
-    error in ErlangError -> {:error, {:hpke_open_failed, error.original}}
+    error in ErlangError -> {:error, {:hpke_open_failed, rescued_reason(error)}}
   end
 
-  defp hpke_open(_entry, _recipient_private_key, _info), do: {:error, :invalid_recipient_entry}
+  defp hpke_open(_entry, _recipient_private_key, _recipient_public_key, _info),
+    do: {:error, :invalid_recipient_entry}
 
   defp dhkem_shared_secret(peer_public_key, private_key, encapsulated_key, recipient_public_key) do
     shared_dh = :crypto.compute_key(:ecdh, peer_public_key, private_key, :x25519)
@@ -279,6 +282,8 @@ defmodule DurableServer.Encryption do
     {:ok, binary_part(output, 0, length)}
   end
 
+  defp hkdf_expand(_prk, _info, length), do: {:error, {:hkdf_length_too_large, length}}
+
   defp envelope_aad(recipient_entries, context) do
     recipient_block = IO.iodata_to_binary(recipient_entries)
 
@@ -304,8 +309,8 @@ defmodule DurableServer.Encryption do
       not is_list(encoded_entries) or encoded_entries == [] ->
         {:error, :invalid_envelope}
 
-      length(encoded_entries) > 65_535 ->
-        {:error, :invalid_envelope}
+      length(encoded_entries) > @max_recipients ->
+        {:error, :too_many_recipients}
 
       true ->
         with {:ok, recipient_entries} <- decode_recipient_entries(encoded_entries),
@@ -336,6 +341,14 @@ defmodule DurableServer.Encryption do
     |> case do
       {:ok, entries} -> {:ok, Enum.reverse(entries)}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp rescued_reason(error) do
+    if Map.has_key?(error, :original) do
+      error.original
+    else
+      Exception.message(error)
     end
   end
 

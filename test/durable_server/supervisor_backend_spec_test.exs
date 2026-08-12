@@ -4,9 +4,8 @@ defmodule DurableServer.SupervisorBackendSpecTest do
   import ExUnit.CaptureLog
 
   alias DurableServer.LifecycleManager
-  alias DurableServer.Backends.EKVStore
-  alias DurableServer.Backends.MirrorStore
-  alias DurableServer.StorageBackend
+  alias DurableServer.Backends.{EKVStore, EncryptedStore, MirrorStore}
+  alias DurableServer.{Encryption, StorageBackend}
 
   def throw_not_ready do
     throw({:error, :not_ready})
@@ -165,6 +164,36 @@ defmodule DurableServer.SupervisorBackendSpecTest do
 
     assert storage_backend.adapter == InMemoryBackend
     assert storage_backend.state.name == :custom
+    assert object_store == nil
+  end
+
+  test "accepts a nested backend module spec in encrypted store" do
+    supervisor_name = unique_supervisor_name("encrypted")
+    prefix = unique_prefix("encrypted")
+    {public_key, private_key} = Encryption.generate_key_pair()
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend:
+           {EncryptedStore,
+            [
+              backend: {InMemoryBackend, name: :encrypted},
+              recipient_public_keys: [public_key],
+              decryption_key: private_key
+            ]},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    %{storage_backend: storage_backend, object_store: object_store} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert storage_backend.adapter == EncryptedStore
+    assert storage_backend.state.backend.adapter == InMemoryBackend
+    assert storage_backend.state.backend.state.name == :encrypted
     assert object_store == nil
   end
 

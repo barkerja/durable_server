@@ -4005,6 +4005,17 @@ defmodule DurableServer.Supervisor do
     |> Keyword.put_new(:task_supervisor, task_sup)
   end
 
+  defp prepare_backend_init_opts(
+         DurableServer.Backends.EncryptedStore,
+         raw_opts,
+         finch,
+         task_sup
+       ) do
+    encryption_opts = normalize_backend_opts(raw_opts)
+    backend = encryption_opts |> Keyword.fetch!(:backend) |> init_backend_spec(finch, task_sup)
+    Keyword.put(encryption_opts, :backend, backend)
+  end
+
   defp prepare_backend_init_opts(DurableServer.Backends.MirrorStore, raw_opts, finch, task_sup) do
     migration_opts = normalize_backend_opts(raw_opts)
 
@@ -4043,6 +4054,13 @@ defmodule DurableServer.Supervisor do
          state: %ObjectStore{} = store
        }) do
     store
+  end
+
+  defp maybe_extract_object_store(%StorageBackend{
+         adapter: DurableServer.Backends.EncryptedStore,
+         state: %{backend: backend}
+       }) do
+    maybe_extract_object_store(backend)
   end
 
   defp maybe_extract_object_store(_), do: nil

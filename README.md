@@ -182,6 +182,55 @@ Use the mirror backend to dual-write while you cut over reads/writes in phases.
 
 See `DurableServer.Backends.MirrorStore` for usage and an example rollout.
 
+### Encrypted Backend
+
+Wrap any backend with `DurableServer.Backends.EncryptedStore` to encrypt state
+before it reaches the underlying store. Encryption uses a fresh content key per
+object and supports multiple X25519 recipients, following the envelope model
+used by `superfly/ltx`.
+
+Generate a key pair once and store the private key in your secret manager:
+
+```elixir
+{public_key, private_key} = DurableServer.Encryption.generate_key_pair()
+
+Base.url_encode64(public_key, padding: false)
+Base.url_encode64(private_key, padding: false)
+```
+
+Decode the keys in runtime configuration and wrap your normal backend:
+
+```elixir
+public_key =
+  "DURABLE_ENCRYPTION_PUBLIC_KEY"
+  |> System.fetch_env!()
+  |> Base.url_decode64!(padding: false)
+
+private_key =
+  "DURABLE_ENCRYPTION_PRIVATE_KEY"
+  |> System.fetch_env!()
+  |> Base.url_decode64!(padding: false)
+
+children = [
+  {DurableServer.Supervisor,
+   name: MyDurableSup,
+   prefix: "my_app/",
+   backend:
+     {DurableServer.Backends.EncryptedStore,
+      backend: {DurableServer.Backends.ObjectStore, object_store_opts},
+      recipient_public_keys: [public_key],
+      decryption_key: private_key}}
+]
+```
+
+Existing plaintext objects remain readable. They are encrypted when they are
+next written. To rotate keys without downtime, first write to both the old and
+new public keys while retaining the old private key; after existing objects
+have been rewritten, deploy the new private key and remove the old recipient.
+
+The storage key is authenticated with the ciphertext, so moving an encrypted
+value to a different key causes decryption to fail.
+
 ## Configuration Options
 
 DurableServer supports these options in the `init/1` return tuple:

@@ -33,7 +33,7 @@ defmodule DurableServer.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :os_mon],
+      extra_applications: [:crypto, :logger, :os_mon],
       mod: {DurableServer.Application, []}
     ]
   end

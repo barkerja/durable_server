@@ -323,7 +323,7 @@ LTXStore pays off when these hold:
   fixed-size fields, or touching a few entries of a large map all produce
   small deltas. AI-agent state — per-conversation transcripts, tool-call
   logs, accumulated memory, checkpoint-per-step plans — is a natural fit
-  (see the agent examples below). A length-changing edit early in the encoded term shifts
+  (see [examples/ai_agents.md](examples/ai_agents.md)). A length-changing edit early in the encoded term shifts
   every later page and degrades that sync toward full-snapshot cost — never
   *worse* than the plain backend's every-sync full write, but no better.
 - **You can spare the read amplification.** A cold restore fetches the head
@@ -340,7 +340,7 @@ Prefer the plain backend when:
 - the payload is **large write-once blobs** (build artifacts, caches, media)
   — those don't belong in *any* DurableServer state, which is
   memory-resident; PUT them to the bucket directly and keep references in
-  state (see the CI/CD example below);
+  state (see [examples/ci_cd_pipelines.md](examples/ci_cd_pipelines.md));
 - your mutation pattern is a wholesale state replacement each sync — every
   delta would be a full rewrite plus segment overhead;
 - you need rock-bottom operational surface: one object per key, no
@@ -364,303 +364,23 @@ children = [
 ```
 
 A representative server — a document holding a large body plus append-only
-history, the ideal delta shape:
+history — is worked through in
+[examples/document_server.md](examples/document_server.md); with a 1 MiB
+body, each edit syncs a delta segment of a few KiB instead of re-uploading
+the full megabyte.
 
-```elixir
-defmodule MyApp.DocumentServer do
-  use DurableServer, vsn: 1
+Further worked examples:
 
-  def dump_state(state), do: state
-  def load_state(_old_vsn, persisted), do: persisted
-
-  def init(state, _info), do: {:ok, state, auto_sync: true, sync_every_ms: 5_000}
-
-  def handle_call({:edit, patch}, _from, state) do
-    state =
-      state
-      |> Map.update!(:body, &apply_patch(&1, patch))
-      |> Map.update!(:history, &[patch | &1])
-
-    {:reply, :ok, state, :sync}
-  end
-end
-
-DurableServer.Supervisor.ensure_started_child(
-  MyDurableSup,
-  {MyApp.DocumentServer, key: "doc_42", initial_state: %{body: "", history: []}}
-)
-```
-
-With a 1 MiB body, each edit syncs a delta segment of roughly the touched
-pages (a few KiB) instead of re-uploading the full megabyte; every ~16th
-sync writes a fresh snapshot and resets the log.
-
-##### AI agents
-
-Agent state is close to the ideal delta shape: a durable object per agent or
-conversation, whose state is a growing transcript, tool-call log, and
-accumulated memory — append-heavy, byte-stable, and synced after every turn.
-With the plain backend, a long-running agent re-uploads its entire history
-on each turn; with LTXStore each turn ships only the new messages.
-
-```elixir
-defmodule MyApp.AgentMemoryServer do
-  use DurableServer, vsn: 1
-
-  # Persist the transcript and distilled memory; drop runtime-only handles
-  # (in-flight LLM request tasks, streaming pids) that must not survive a
-  # rehome.
-  def dump_state(state), do: Map.drop(state, [:inflight])
-  def load_state(_old_vsn, persisted), do: Map.put(persisted, :inflight, nil)
-
-  def init(state, _info), do: {:ok, state}
-
-  def handle_call({:turn, user_message, assistant_reply, tool_calls}, _from, state) do
-    state =
-      state
-      |> Map.update!(:messages, &(&1 ++ [user_message, assistant_reply]))
-      |> Map.update!(:tool_log, &(&1 ++ tool_calls))
-
-    # Durable after every turn: a crash or rehome resumes the conversation
-    # with nothing lost, and the sync cost is the new messages, not the
-    # whole transcript.
-    {:reply, :ok, state, :sync}
-  end
-
-  def handle_call({:remember, fact}, _from, state) do
-    {:reply, :ok, Map.update!(state, :memory, &Map.merge(&1, fact)), :sync}
-  end
-end
-
-DurableServer.Supervisor.ensure_started_child(
-  MyDurableSup,
-  {MyApp.AgentMemoryServer,
-   key: "agent:" <> conversation_id,
-   initial_state: %{messages: [], tool_log: [], memory: %{}, inflight: nil}}
-)
-```
-
-A 500 KiB transcript grows by one page or two per turn, so each `:sync`
-ships a few KiB. Combined with the encrypted composition below, per-user
-agent memory is also sealed and key-bound at rest.
-
-The same shape hosts an agent-framework struct — for example a
-[Jido](https://github.com/agentjido/jido) agent, where the framework's
-agent state (schema fields, instruction results, queued directives) lives
-inside the durable state and every instruction step is checkpointed:
-
-```elixir
-defmodule MyApp.DurableJidoServer do
-  use DurableServer, vsn: 1
-
-  def dump_state(state), do: state
-  def load_state(_old_vsn, persisted), do: persisted
-
-  def init(%{agent: nil} = state, info) do
-    # First boot: create the Jido agent; restarts restore it as-is — the
-    # LTX image preserves the struct exactly (atoms, nested structs, refs).
-    {:ok, %{state | agent: MyApp.PlannerAgent.new(info.key)}}
-  end
-
-  def init(state, _info), do: {:ok, state}
-
-  def handle_call({:instruct, instruction, params}, _from, %{agent: agent} = state) do
-    case MyApp.PlannerAgent.cmd(agent, instruction, params) do
-      {:ok, agent, directives} ->
-        state = %{state | agent: agent, steps: state.steps + 1}
-        # Checkpoint after every instruction: a killed node resumes the
-        # plan mid-flight instead of restarting it.
-        {:reply, {:ok, directives}, state, :sync}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-end
-```
-
-Only the fields the instruction touched change in the encoded state, so
-checkpoint-per-step stays cheap even as the agent's working memory grows.
-The usual persistence rules apply unchanged: keep runtime-only resources
-(sockets, tasks, framework supervisor pids) out of `dump_state/1`, exactly
-as with any DurableServer.
-
-##### A sharded BM25 search engine — encrypted and compacted
-
-Inverted-index shards are large, long-lived, rehomeable state: exactly what
-the durable-object model plus segment persistence is for. Each shard is one
-DurableServer holding postings, document lengths, and corpus statistics;
-documents route to a shard by hash, and queries fan out and merge scores.
-With the encrypted composition, index contents are sealed and key-bound at
-rest, and compaction (snapshot resets at `:max_segments`) is automatic.
-
-```elixir
-# Supervisor: segments over sealed objects, as in the composition above.
-backend:
-  {DurableServer.Backends.LTXStore,
-   backend:
-     {DurableServer.Backends.EncryptedStore,
-      backend: {DurableServer.Backends.ObjectStore, object_store_opts},
-      recipient_public_keys: [public_key],
-      decryption_key: private_key}}
-```
-
-```elixir
-defmodule MyApp.SearchShard do
-  use DurableServer, vsn: 1
-
-  @k1 1.2
-  @b 0.75
-
-  def dump_state(state), do: state
-  def load_state(_old_vsn, persisted), do: persisted
-  def init(state, _info), do: {:ok, state}
-
-  def handle_call({:index, docs}, _from, state) do
-    {:reply, :ok, Enum.reduce(docs, state, &index_doc/2), :sync}
-  end
-
-  # Queries are read-only — no sync, no storage traffic.
-  def handle_call({:search, terms, limit}, _from, state) do
-    {:reply, top_k(state, terms, limit), state}
-  end
-
-  defp index_doc({id, text}, state) do
-    terms = tokenize(text)
-
-    postings =
-      Enum.reduce(Enum.frequencies(terms), state.postings, fn {term, tf}, acc ->
-        Map.update(acc, term, %{id => tf}, &Map.put(&1, id, tf))
-      end)
-
-    %{
-      state
-      | postings: postings,
-        doc_lens: Map.put(state.doc_lens, id, length(terms)),
-        total_len: state.total_len + length(terms)
-    }
-  end
-
-  defp top_k(state, terms, limit) do
-    n = map_size(state.doc_lens)
-    avg_len = if n > 0, do: state.total_len / n, else: 1.0
-
-    terms
-    |> Enum.reduce(%{}, fn term, scores ->
-      docs = Map.get(state.postings, term, %{})
-      idf = :math.log(1 + (n - map_size(docs) + 0.5) / (map_size(docs) + 0.5))
-
-      Enum.reduce(docs, scores, fn {id, tf}, scores ->
-        len = Map.fetch!(state.doc_lens, id)
-        score = idf * (tf * (@k1 + 1)) / (tf + @k1 * (1 - @b + @b * len / avg_len))
-        Map.update(scores, id, score, &(&1 + score))
-      end)
-    end)
-    |> Enum.sort_by(fn {_id, score} -> -score end)
-    |> Enum.take(limit)
-  end
-
-  defp tokenize(text),
-    do: text |> String.downcase() |> String.split(~r/[^a-z0-9]+/, trim: true)
-end
-
-defmodule MyApp.Search do
-  @shards 8
-
-  def index(id, text) do
-    {:ok, {pid, _meta}} = shard(:erlang.phash2(id, @shards))
-    GenServer.call(pid, {:index, [{id, text}]})
-  end
-
-  def search(query, limit \\ 10) do
-    terms = query |> String.downcase() |> String.split()
-
-    0..(@shards - 1)
-    |> Task.async_stream(fn n ->
-      {:ok, {pid, _meta}} = shard(n)
-      GenServer.call(pid, {:search, terms, limit})
-    end)
-    |> Enum.flat_map(fn {:ok, hits} -> hits end)
-    |> Enum.sort_by(fn {_id, score} -> -score end)
-    |> Enum.take(limit)
-  end
-
-  defp shard(n) do
-    DurableServer.Supervisor.ensure_started_child(
-      MyDurableSup,
-      {MyApp.SearchShard,
-       key: "search:shard:#{n}",
-       initial_state: %{postings: %{}, doc_lens: %{}, total_len: 0}}
-    )
-  end
-end
-```
-
-An honest cost note: posting lists are length-changing map values, so
-indexing one document shifts every encoded byte after the earliest touched
-term — per-document syncs degrade toward snapshot cost. Index in batches
-(one `:sync` per batch, as above) and the rewrite amortizes; queries cost
-nothing. What the segment model buys the search shard is cheap durability
-for *incremental* progress, bounded-restore rehoming of multi-megabyte
-shards, and encryption at rest — not free single-document indexing.
-
-##### CI/CD pipeline orchestration
-
-A pipeline run is a durable object whose state is an event log plus the
-derived job DAG — append-only, synced on every transition, so a coordinator
-deploy or crash resumes every in-flight pipeline exactly where it stopped
-(on any node, thanks to rehoming).
-
-One thing this is deliberately **not**: artifact or cache storage. Durable
-state is memory-resident and delta-synced — wrong on both counts for large
-write-once blobs, which need neither CAS fencing nor deltas. Jobs PUT
-artifacts straight to the bucket as plain objects; the run state tracks
-references only.
-
-```elixir
-defmodule MyApp.PipelineRun do
-  use DurableServer, vsn: 1
-
-  def dump_state(state), do: state
-  def load_state(_old_vsn, persisted), do: persisted
-  def init(state, _info), do: {:ok, state}
-
-  # Every transition appends to the event log and checkpoints. The reply
-  # tells the caller which jobs became runnable.
-  def handle_call({:event, event}, _from, state) do
-    state =
-      state
-      |> Map.update!(:events, &(&1 ++ [event]))
-      |> apply_event(event)
-
-    {:reply, runnable_jobs(state), state, :sync}
-  end
-
-  defp apply_event(state, {:job_finished, job, :ok, artifact_refs}) do
-    # References to bucket objects the job already uploaded — never the
-    # artifact bytes themselves.
-    %{state | jobs: Map.put(state.jobs, job, {:succeeded, artifact_refs})}
-  end
-
-  defp apply_event(state, {:job_finished, job, {:error, reason}, _refs}) do
-    %{state | jobs: Map.update!(state.jobs, job, fn _ -> {:failed, reason} end)}
-  end
-
-  # ... {:job_started, ...}, {:job_retried, ...}, dependency resolution ...
-  defp runnable_jobs(state), do: MyApp.DAG.ready(state.jobs, state.dag)
-end
-
-DurableServer.Supervisor.ensure_started_child(
-  MyDurableSup,
-  {MyApp.PipelineRun,
-   key: "run:" <> run_id,
-   initial_state: %{dag: dag, jobs: initial_jobs(dag), events: []}}
-)
-```
-
-The event log is the ideal delta shape — each transition ships the pages
-holding the new event and the touched job entry — and a run's full history
-remains queryable for as long as the run object lives.
+- [examples/ai_agents.md](examples/ai_agents.md) — per-conversation agent
+  memory synced after every turn, and a Jido agent struct checkpointed after
+  every instruction step.
+- [examples/bm25_search.md](examples/bm25_search.md) — a sharded BM25 search
+  engine: hash-routed indexing, fan-out queries, encrypted at rest,
+  compacted automatically — with an honest note on what deltas do and don't
+  buy an inverted index.
+- [examples/ci_cd_pipelines.md](examples/ci_cd_pipelines.md) — event-sourced
+  pipeline runs that resume across coordinator deploys, tracking artifact
+  *references* while the artifacts themselves stay plain bucket objects.
 
 Options (all set on the `LTXStore` spec):
 

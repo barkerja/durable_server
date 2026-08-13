@@ -381,6 +381,10 @@ Further worked examples:
 - [examples/ci_cd_pipelines.md](examples/ci_cd_pipelines.md) — event-sourced
   pipeline runs that resume across coordinator deploys, tracking artifact
   *references* while the artifacts themselves stay plain bucket objects.
+- [examples/inspecting_the_log.md](examples/inspecting_the_log.md) — the
+  machinery itself: what lands in the bucket, decoding segments with the
+  `DurableServer.LTX` codec, watching deltas, snapshot resets, and the
+  checksum chain, and sweeping orphans by hand.
 
 Options (all set on the `LTXStore` spec):
 

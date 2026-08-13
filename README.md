@@ -337,6 +337,10 @@ Prefer the plain backend when:
 - you rely on **inspecting stored JSON** in the bucket — LTX heads and
   segments are opaque envelopes, not human-readable state (the trade that
   buys full term fidelity: atom keys, pids, and refs survive);
+- the payload is **large write-once blobs** (build artifacts, caches, media)
+  — those don't belong in *any* DurableServer state, which is
+  memory-resident; PUT them to the bucket directly and keep references in
+  state (see the CI/CD example below);
 - your mutation pattern is a wholesale state replacement each sync — every
   delta would be a full rewrite plus segment overhead;
 - you need rock-bottom operational surface: one object per key, no
@@ -480,6 +484,183 @@ checkpoint-per-step stays cheap even as the agent's working memory grows.
 The usual persistence rules apply unchanged: keep runtime-only resources
 (sockets, tasks, framework supervisor pids) out of `dump_state/1`, exactly
 as with any DurableServer.
+
+##### A sharded BM25 search engine — encrypted and compacted
+
+Inverted-index shards are large, long-lived, rehomeable state: exactly what
+the durable-object model plus segment persistence is for. Each shard is one
+DurableServer holding postings, document lengths, and corpus statistics;
+documents route to a shard by hash, and queries fan out and merge scores.
+With the encrypted composition, index contents are sealed and key-bound at
+rest, and compaction (snapshot resets at `:max_segments`) is automatic.
+
+```elixir
+# Supervisor: segments over sealed objects, as in the composition above.
+backend:
+  {DurableServer.Backends.LTXStore,
+   backend:
+     {DurableServer.Backends.EncryptedStore,
+      backend: {DurableServer.Backends.ObjectStore, object_store_opts},
+      recipient_public_keys: [public_key],
+      decryption_key: private_key}}
+```
+
+```elixir
+defmodule MyApp.SearchShard do
+  use DurableServer, vsn: 1
+
+  @k1 1.2
+  @b 0.75
+
+  def dump_state(state), do: state
+  def load_state(_old_vsn, persisted), do: persisted
+  def init(state, _info), do: {:ok, state}
+
+  def handle_call({:index, docs}, _from, state) do
+    {:reply, :ok, Enum.reduce(docs, state, &index_doc/2), :sync}
+  end
+
+  # Queries are read-only — no sync, no storage traffic.
+  def handle_call({:search, terms, limit}, _from, state) do
+    {:reply, top_k(state, terms, limit), state}
+  end
+
+  defp index_doc({id, text}, state) do
+    terms = tokenize(text)
+
+    postings =
+      Enum.reduce(Enum.frequencies(terms), state.postings, fn {term, tf}, acc ->
+        Map.update(acc, term, %{id => tf}, &Map.put(&1, id, tf))
+      end)
+
+    %{
+      state
+      | postings: postings,
+        doc_lens: Map.put(state.doc_lens, id, length(terms)),
+        total_len: state.total_len + length(terms)
+    }
+  end
+
+  defp top_k(state, terms, limit) do
+    n = map_size(state.doc_lens)
+    avg_len = if n > 0, do: state.total_len / n, else: 1.0
+
+    terms
+    |> Enum.reduce(%{}, fn term, scores ->
+      docs = Map.get(state.postings, term, %{})
+      idf = :math.log(1 + (n - map_size(docs) + 0.5) / (map_size(docs) + 0.5))
+
+      Enum.reduce(docs, scores, fn {id, tf}, scores ->
+        len = Map.fetch!(state.doc_lens, id)
+        score = idf * (tf * (@k1 + 1)) / (tf + @k1 * (1 - @b + @b * len / avg_len))
+        Map.update(scores, id, score, &(&1 + score))
+      end)
+    end)
+    |> Enum.sort_by(fn {_id, score} -> -score end)
+    |> Enum.take(limit)
+  end
+
+  defp tokenize(text),
+    do: text |> String.downcase() |> String.split(~r/[^a-z0-9]+/, trim: true)
+end
+
+defmodule MyApp.Search do
+  @shards 8
+
+  def index(id, text) do
+    {:ok, {pid, _meta}} = shard(:erlang.phash2(id, @shards))
+    GenServer.call(pid, {:index, [{id, text}]})
+  end
+
+  def search(query, limit \\ 10) do
+    terms = query |> String.downcase() |> String.split()
+
+    0..(@shards - 1)
+    |> Task.async_stream(fn n ->
+      {:ok, {pid, _meta}} = shard(n)
+      GenServer.call(pid, {:search, terms, limit})
+    end)
+    |> Enum.flat_map(fn {:ok, hits} -> hits end)
+    |> Enum.sort_by(fn {_id, score} -> -score end)
+    |> Enum.take(limit)
+  end
+
+  defp shard(n) do
+    DurableServer.Supervisor.ensure_started_child(
+      MyDurableSup,
+      {MyApp.SearchShard,
+       key: "search:shard:#{n}",
+       initial_state: %{postings: %{}, doc_lens: %{}, total_len: 0}}
+    )
+  end
+end
+```
+
+An honest cost note: posting lists are length-changing map values, so
+indexing one document shifts every encoded byte after the earliest touched
+term — per-document syncs degrade toward snapshot cost. Index in batches
+(one `:sync` per batch, as above) and the rewrite amortizes; queries cost
+nothing. What the segment model buys the search shard is cheap durability
+for *incremental* progress, bounded-restore rehoming of multi-megabyte
+shards, and encryption at rest — not free single-document indexing.
+
+##### CI/CD pipeline orchestration
+
+A pipeline run is a durable object whose state is an event log plus the
+derived job DAG — append-only, synced on every transition, so a coordinator
+deploy or crash resumes every in-flight pipeline exactly where it stopped
+(on any node, thanks to rehoming).
+
+One thing this is deliberately **not**: artifact or cache storage. Durable
+state is memory-resident and delta-synced — wrong on both counts for large
+write-once blobs, which need neither CAS fencing nor deltas. Jobs PUT
+artifacts straight to the bucket as plain objects; the run state tracks
+references only.
+
+```elixir
+defmodule MyApp.PipelineRun do
+  use DurableServer, vsn: 1
+
+  def dump_state(state), do: state
+  def load_state(_old_vsn, persisted), do: persisted
+  def init(state, _info), do: {:ok, state}
+
+  # Every transition appends to the event log and checkpoints. The reply
+  # tells the caller which jobs became runnable.
+  def handle_call({:event, event}, _from, state) do
+    state =
+      state
+      |> Map.update!(:events, &(&1 ++ [event]))
+      |> apply_event(event)
+
+    {:reply, runnable_jobs(state), state, :sync}
+  end
+
+  defp apply_event(state, {:job_finished, job, :ok, artifact_refs}) do
+    # References to bucket objects the job already uploaded — never the
+    # artifact bytes themselves.
+    %{state | jobs: Map.put(state.jobs, job, {:succeeded, artifact_refs})}
+  end
+
+  defp apply_event(state, {:job_finished, job, {:error, reason}, _refs}) do
+    %{state | jobs: Map.update!(state.jobs, job, fn _ -> {:failed, reason} end)}
+  end
+
+  # ... {:job_started, ...}, {:job_retried, ...}, dependency resolution ...
+  defp runnable_jobs(state), do: MyApp.DAG.ready(state.jobs, state.dag)
+end
+
+DurableServer.Supervisor.ensure_started_child(
+  MyDurableSup,
+  {MyApp.PipelineRun,
+   key: "run:" <> run_id,
+   initial_state: %{dag: dag, jobs: initial_jobs(dag), events: []}}
+)
+```
+
+The event log is the ideal delta shape — each transition ships the pages
+holding the new event and the touched job entry — and a run's full history
+remains queryable for as long as the run object lives.
 
 Options (all set on the `LTXStore` spec):
 

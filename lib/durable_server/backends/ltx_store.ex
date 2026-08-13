@@ -62,6 +62,8 @@ defmodule DurableServer.Backends.LTXStore do
   alias DurableServer.LTX
   alias DurableServer.LTX.{Decoder, Encoder, PagedTerm}
 
+  require Logger
+
   @head_marker "__durable_server_ltx__"
   @segment_marker "__durable_server_ltx_segment__"
   @format_version 1
@@ -128,6 +130,180 @@ defmodule DurableServer.Backends.LTXStore do
   @impl true
   def ensure_ready(%{backend: backend}), do: StorageBackend.ensure_ready(backend)
 
+  @doc """
+  Deletes orphaned segment objects — segments no manifest references, left
+  behind by lost head-CAS races or interrupted writes.
+
+  Safe to run from any node at any time, concurrently with live traffic:
+
+    * a segment referenced by its key's manifest is always kept;
+    * an unreferenced segment is deleted only when its TXID range lies at or
+      below the head's current TXID — the head has provably advanced past
+      it, so no in-flight write can still be about to reference it;
+    * segments whose key has no head (an interrupted first write, or a
+      deleted key) and unreferenced segments *ahead* of the head are deleted
+      only when the storage layer reports their age and it exceeds
+      `:min_age_ms` (default one hour); with unknown age they are kept.
+
+  Options:
+
+    * `:prefix` (default `""`) — restrict the sweep to keys under a prefix
+      (e.g. a supervisor's storage prefix);
+    * `:min_age_ms` (default `3_600_000`) — minimum age before an in-flight
+      or headless segment is considered abandoned.
+
+  Returns `{:ok, %{deleted: n, kept: n, keys: n}}`. Deletion failures are
+  counted as kept and retried by the next sweep. Run it from a cron job, a
+  periodic task, or an operator console:
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(MyDurableSup)
+      DurableServer.Backends.LTXStore.sweep_orphans(backend, prefix: "my_app/")
+  """
+  @spec sweep_orphans(StorageBackend.t(), keyword()) ::
+          {:ok, %{deleted: non_neg_integer(), kept: non_neg_integer(), keys: non_neg_integer()}}
+  def sweep_orphans(%StorageBackend{adapter: __MODULE__, state: state}, opts \\ []) do
+    opts = Keyword.validate!(opts, prefix: "", min_age_ms: 3_600_000)
+    prefix = Keyword.fetch!(opts, :prefix)
+    min_age_ms = Keyword.fetch!(opts, :min_age_ms)
+
+    segments_by_key =
+      state.backend
+      |> StorageBackend.list_all_objects_stream(@segment_root <> prefix,
+        error_handler: fn reason -> throw({:sweep_list_failed, reason}) end
+      )
+      |> Enum.reduce(%{}, fn %{key: object_key} = object, acc ->
+        case parse_segment_object_key(object_key) do
+          {:ok, key, name} ->
+            Map.update(acc, key, [{name, object}], &[{name, object} | &1])
+
+          :error ->
+            acc
+        end
+      end)
+
+    summary =
+      Enum.reduce(segments_by_key, %{deleted: 0, kept: 0, keys: map_size(segments_by_key)}, fn
+        {key, segments}, acc ->
+          sweep_key(state, key, segments, min_age_ms, acc)
+      end)
+
+    if summary.deleted > 0 do
+      Logger.info(
+        "DurableServer.Backends.LTXStore swept #{summary.deleted} orphaned segment(s) across #{summary.keys} key(s) (kept #{summary.kept})"
+      )
+    end
+
+    {:ok, summary}
+  catch
+    {:sweep_list_failed, reason} -> {:error, {:sweep_list_failed, reason}}
+  end
+
+  defp sweep_key(state, key, segments, min_age_ms, acc) do
+    head_info =
+      case StorageBackend.get_object(state.backend, key, consistent: true) do
+        {:ok, %{body: %{@head_marker => _v, "txid" => txid, "segments" => manifest}}}
+        when is_integer(txid) and is_list(manifest) ->
+          {:head, txid, MapSet.new(manifest, & &1["name"])}
+
+        {:ok, _legacy_or_malformed} ->
+          :no_ltx_head
+
+        {:error, :not_found} ->
+          :no_ltx_head
+
+        {:error, _reason} ->
+          # Can't establish the head's state; keep everything this round.
+          :unreachable
+      end
+
+    Enum.reduce(segments, acc, fn {name, object}, acc ->
+      decision =
+        case head_info do
+          :unreachable ->
+            :keep
+
+          {:head, head_txid, referenced} ->
+            if MapSet.member?(referenced, name) do
+              :keep
+            else
+              decide_unreferenced(name, object, head_txid, min_age_ms)
+            end
+
+          :no_ltx_head ->
+            decide_by_age(object, min_age_ms)
+        end
+
+      case decision do
+        :delete ->
+          case StorageBackend.delete_object(state.backend, @segment_root <> key <> "/" <> name) do
+            :ok -> %{acc | deleted: acc.deleted + 1}
+            _other -> %{acc | kept: acc.kept + 1}
+          end
+
+        :keep ->
+          %{acc | kept: acc.kept + 1}
+      end
+    end)
+  end
+
+  # Unreferenced, with a live head: ranges the head has advanced past can
+  # never be referenced again — no age needed. Ranges ahead of the head may
+  # belong to an in-flight write; require a known, sufficient age.
+  defp decide_unreferenced(name, object, head_txid, min_age_ms) do
+    case parse_segment_name(name) do
+      {:ok, _min_txid, max_txid} when max_txid <= head_txid -> :delete
+      {:ok, _min_txid, _max_txid} -> decide_by_age(object, min_age_ms)
+      :error -> decide_by_age(object, min_age_ms)
+    end
+  end
+
+  defp decide_by_age(object, min_age_ms) do
+    case object_age_ms(object) do
+      {:ok, age_ms} when age_ms >= min_age_ms -> :delete
+      _other -> :keep
+    end
+  end
+
+  defp object_age_ms(%{last_modified: %DateTime{} = at}),
+    do: {:ok, DateTime.diff(DateTime.utc_now(), at, :millisecond)}
+
+  defp object_age_ms(%{last_modified: at}) when is_binary(at) do
+    case DateTime.from_iso8601(at) do
+      {:ok, datetime, _offset} ->
+        {:ok, DateTime.diff(DateTime.utc_now(), datetime, :millisecond)}
+
+      _other ->
+        :unknown
+    end
+  end
+
+  defp object_age_ms(_object), do: :unknown
+
+  defp parse_segment_object_key(@segment_root <> rest) do
+    case String.split(rest, "/") do
+      parts when length(parts) >= 2 ->
+        {key_parts, [name]} = Enum.split(parts, -1)
+        {:ok, Enum.join(key_parts, "/"), name}
+
+      _other ->
+        :error
+    end
+  end
+
+  defp parse_segment_object_key(_key), do: :error
+
+  defp parse_segment_name(
+         <<min::binary-size(16), ?-, max::binary-size(16), ?., _nonce::binary-size(8),
+           ".ltx">>
+       ) do
+    with {:ok, min_txid} <- LTX.parse_txid(min),
+         {:ok, max_txid} <- LTX.parse_txid(max) do
+      {:ok, min_txid, max_txid}
+    end
+  end
+
+  defp parse_segment_name(_name), do: :error
+
   @impl true
   def get_object(%__MODULE__{} = state, key, opts) do
     case StorageBackend.get_object(state.backend, key, opts) do
@@ -136,10 +312,23 @@ defmodule DurableServer.Backends.LTXStore do
           {:ok, object} ->
             {:ok, object}
 
-          {:error, _reason} ->
+          {:error, reason} ->
             # A concurrent snapshot reset may have deleted a segment we were
             # reading. One retry against a freshly read head resolves it.
-            retry_restore(state, key)
+            case retry_restore(state, key) do
+              {:ok, object} ->
+                {:ok, object}
+
+              {:error, final_reason} = error ->
+                # No :telemetry.execute/3 here: :telemetry is only a
+                # transitive dependency of this library, so observability is
+                # logging — see the equivalent note in the encrypted backend.
+                Logger.warning(
+                  "DurableServer.Backends.LTXStore failed to restore #{inspect(key)}: #{inspect(final_reason)} (first attempt: #{inspect(reason)})"
+                )
+
+                error
+            end
         end
 
       {:ok, %{body: _legacy} = object} ->
@@ -684,20 +873,30 @@ defmodule DurableServer.Backends.LTXStore do
 
   # -- Cache -----------------------------------------------------------------
 
+  # The cache is an optimization only: if its ETS table is gone (its owner —
+  # the process that ran init_backend — has exited, e.g. during shutdown
+  # while a child persists its final status), every operation degrades to a
+  # cache miss and writes take the snapshot path.
   defp cache_get(%{cache: cache}, key) do
     case :ets.lookup(cache, key) do
       [{^key, entry}] -> entry
       [] -> nil
     end
+  rescue
+    ArgumentError -> nil
   end
 
   defp cache_put(%{cache: cache}, key, etag, txid, image, manifest) do
     :ets.insert(cache, {key, %{etag: etag, txid: txid, image: image, manifest: manifest}})
     :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   defp cache_delete(%{cache: cache}, key) do
     :ets.delete(cache, key)
     :ok
+  rescue
+    ArgumentError -> :ok
   end
 end

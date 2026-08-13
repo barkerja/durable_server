@@ -299,6 +299,89 @@ everything under a prefix. If your workload doesn't naturally touch every
 object, step 1 requires you to write your own backfill (read and rewrite each
 key, for example via `list_all_objects_stream`) before step 3 is safe.
 
+### LTX Segment Backend
+
+Wrap any backend with `DurableServer.Backends.LTXStore` to persist each key
+as a log of [LTX](https://github.com/superfly/ltx) segments instead of one
+full-state object — the persistence model Litestream uses for
+SQLite, applied to DurableServer state. A sync then writes only the pages of
+the encoded state that actually changed, which matters for large states:
+benchmarked point mutations of a 1 MiB state write ~3% of the full-state
+bytes, and appends under 1%.
+
+```elixir
+children = [
+  {DurableServer.Supervisor,
+   name: MyDurableSup,
+   prefix: "my_app/",
+   backend:
+     {DurableServer.Backends.LTXStore,
+      backend: {DurableServer.Backends.ObjectStore, object_store_opts}}}
+]
+```
+
+The object at the key itself remains the **head**: it carries the current
+transaction id, rolling checksum, and segment manifest, and it is the sole
+CAS/fencing point — ownership semantics are identical to the plain backend.
+Segments are immutable objects under the global `__ltx/` namespace, named
+with a random nonce so concurrent writers can never overwrite each other's
+bytes. Three write paths are chosen automatically:
+
+- states encoding to at most `:inline_threshold_pages` pages (default 4, so
+  16 KiB at the default 4096-byte `:page_size`) are embedded in the head
+  directly — one PUT, the same cost as the plain backend;
+- when the writer holds the previous image (populated by any read or write,
+  so a rehomed owner deltas immediately after its first restore) and the
+  caller's etag matches, only changed pages ship as one delta segment
+  followed by the head CAS;
+- otherwise — and whenever the manifest reaches `:max_segments` (default
+  16) — the full image ships as one snapshot segment and the log resets,
+  bounding restore cost. Segments the new head no longer references are
+  deleted eagerly (there is no retention window; superseded history is not
+  kept).
+
+Reads restore the head's manifest: every segment's file checksum, the
+transaction-id chain, the checksum chain, and the final rolling checksum are
+all verified, and anything inconsistent fails closed with an error — never
+`{:error, :not_found}`, so a damaged log can never be mistaken for a fresh
+key and silently overwritten. Objects written before LTXStore was introduced
+read through unchanged and convert to segment form on their next write.
+
+A lost head CAS can leave an orphan segment no manifest references. Sweep
+them periodically (from a cron job or operator console — it is safe to run
+anywhere, anytime, concurrently with live traffic):
+
+```elixir
+%{storage_backend: backend} = DurableServer.Supervisor.__get_config__(MyDurableSup)
+DurableServer.Backends.LTXStore.sweep_orphans(backend, prefix: "my_app/")
+```
+
+To encrypt, compose with the encrypted backend **under** the segment layer,
+so heads and segments are sealed per object and bound to their storage keys:
+
+```elixir
+backend:
+  {DurableServer.Backends.LTXStore,
+   backend:
+     {DurableServer.Backends.EncryptedStore,
+      backend: {DurableServer.Backends.ObjectStore, object_store_opts},
+      recipient_public_keys: [public_key],
+      decryption_key: private_key}}
+```
+
+The reverse order would seal the term before paging it, and a fresh content
+key per seal means no two syncs ever share bytes — deltas would never match.
+Note the encrypted backend's 16 MiB payload bound applies per sealed object,
+which caps practical state size around 10 MiB for this composition
+(segment bytes carry base64 overhead through the wrapped codec).
+
+Known limits: storage subscriptions are not supported (heartbeat tracking
+falls back to `:poll`), child keys must not live under the reserved `__ltx/`
+namespace, encoded states are capped at 1 GiB, and delta efficiency depends
+on byte-stable mutations — a length-changing edit early in the encoded term
+shifts every later page and degrades that sync toward full-snapshot cost
+(never worse than the plain backend's every-sync full write).
+
 ## Configuration Options
 
 DurableServer supports these options in the `init/1` return tuple:

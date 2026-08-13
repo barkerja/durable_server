@@ -7,10 +7,6 @@ defmodule DurableServer.TestMemoryBackend do
 
   @behaviour DurableServer.StorageBackend
 
-  alias DurableServer.StorageBackend
-
-  @behaviour StorageBackend
-
   @impl true
   def init_backend(table) do
     {:ok,
@@ -63,14 +59,14 @@ defmodule DurableServer.TestMemoryBackend do
 
       case mode do
         :commit_then_conflict ->
-          :ets.insert(table, {{:object, key}, body, etag})
+          store(table, key, body, etag)
           {:error, :conflict}
 
         :conflict ->
           {:error, :conflict}
 
         :normal ->
-          :ets.insert(table, {{:object, key}, body, etag})
+          store(table, key, body, etag)
           {:ok, %{body: body, etag: etag}}
       end
     end
@@ -85,9 +81,26 @@ defmodule DurableServer.TestMemoryBackend do
   @impl true
   def try_claim(%{table: table}, key, body) do
     case :ets.insert_new(table, {{:object, key}, body, "1"}) do
-      true -> {:ok, {:claimed, "1"}}
-      false -> {:error, :already_claimed}
+      true ->
+        notify_subscribers(table, key, body)
+        {:ok, {:claimed, "1"}}
+
+      false ->
+        {:error, :already_claimed}
     end
+  end
+
+  @impl true
+  def subscribe(%{table: table}, subscriber, prefix, _opts) do
+    ref = make_ref()
+    :ets.insert(table, {{:subscriber, ref}, subscriber, prefix})
+    {:ok, ref}
+  end
+
+  @impl true
+  def unsubscribe(%{table: table}, ref) do
+    :ets.delete(table, {:subscriber, ref})
+    :ok
   end
 
   @impl true
@@ -128,4 +141,25 @@ defmodule DurableServer.TestMemoryBackend do
     end
   end
 
+  defp store(table, key, body, etag) do
+    :ets.insert(table, {{:object, key}, body, etag})
+    notify_subscribers(table, key, body)
+  end
+
+  defp notify_subscribers(table, key, body) do
+    table
+    |> :ets.tab2list()
+    |> Enum.each(fn
+      {{:subscriber, _ref}, subscriber, prefix} ->
+        if String.starts_with?(key, prefix) do
+          send(
+            subscriber,
+            {:durable_server_storage_events, [%{type: :put, key: key, value: body}]}
+          )
+        end
+
+      _other ->
+        :ok
+    end)
+  end
 end

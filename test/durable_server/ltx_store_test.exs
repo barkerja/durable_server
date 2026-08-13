@@ -343,6 +343,150 @@ defmodule DurableServer.LTXStoreTest do
     assert :ok = StorageBackend.delete_object(store, key)
   end
 
+  describe "subscribe/4" do
+    test "decodes inline head events and hides segment traffic", context do
+      assert {:ok, subscription_ref} =
+               StorageBackend.subscribe(context.store, self(), "server/")
+
+      small = %{count: 1}
+      assert {:ok, _object} = StorageBackend.put_object(context.store, "server/1", small)
+
+      assert_receive {:durable_server_storage_events,
+                      [%{type: :put, key: "server/1", value: ^small}]}
+
+      # A segment-form write produces exactly one logical event — the
+      # segment object's own put is invisible to subscribers.
+      big = big_state(1)
+      assert {:ok, _object} = StorageBackend.put_object(context.store, "server/2", big)
+
+      assert_receive {:durable_server_storage_events,
+                      [%{type: :put, key: "server/2", value: ^big}]}
+
+      refute_receive {:durable_server_storage_events, _events}, 100
+
+      assert :ok = StorageBackend.unsubscribe(context.store, subscription_ref)
+    end
+
+    test "passes legacy (unmarked) values through unchanged", context do
+      assert {:ok, _ref} = StorageBackend.subscribe(context.store, self(), "server/")
+
+      # Simulate a legacy writer putting a plain value directly underneath.
+      {:ok, memory} = StorageBackend.init_backend(DurableServer.TestMemoryBackend, context.table)
+      assert {:ok, _object} = StorageBackend.put_object(memory, "server/legacy", %{"old" => true})
+
+      assert_receive {:durable_server_storage_events,
+                      [%{key: "server/legacy", value: %{"old" => true}}]}
+    end
+
+    test "tears down the relay and inner subscription when the subscriber dies", context do
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+
+      assert {:ok, {relay_pid, inner_ref}} =
+               StorageBackend.subscribe(context.store, subscriber, "server/")
+
+      assert Process.alive?(relay_pid)
+
+      assert [{{:subscriber, ^inner_ref}, ^relay_pid, "server/"}] =
+               :ets.lookup(context.table, {:subscriber, inner_ref})
+
+      relay_monitor = Process.monitor(relay_pid)
+      Process.exit(subscriber, :kill)
+
+      assert_receive {:DOWN, ^relay_monitor, :process, ^relay_pid, _reason}
+      assert :ets.lookup(context.table, {:subscriber, inner_ref}) == []
+    end
+
+    test "heartbeat defaults pass through the wrapped backend", context do
+      assert StorageBackend.defaults(context.store).heartbeat_tracking_mode == :subscribe
+      assert StorageBackend.supports?(context.store, :heartbeat_subscribe?)
+    end
+  end
+
+  describe "DurableServer.LTX.Sweeper" do
+    test "sweeps on demand and on its schedule", context do
+      assert {:ok, %{etag: etag}} = StorageBackend.put_object(context.store, "server/1", big_state(1))
+      assert {:ok, _object} = StorageBackend.put_object(context.store, "server/1", big_state(2), etag: etag)
+
+      orphan = "0000000000000001-0000000000000001.deadbeef.ltx"
+      :ets.insert(context.table, {{:object, "__ltx/server/1/" <> orphan}, %{"junk" => true}, "9"})
+
+      {:ok, sweeper} =
+        DurableServer.LTX.Sweeper.start_link(
+          backend: context.store,
+          interval_ms: 3_600_000
+        )
+
+      assert {:ok, %{deleted: 1}} = DurableServer.LTX.Sweeper.sweep_now(sweeper)
+      refute ("__ltx/server/1/" <> orphan) in segment_keys(context, "server/1")
+
+      # Scheduled path: a fresh orphan is collected without manual prodding.
+      :ets.insert(context.table, {{:object, "__ltx/server/1/" <> orphan}, %{"junk" => true}, "9"})
+
+      {:ok, _fast_sweeper} =
+        DurableServer.LTX.Sweeper.start_link(backend: context.store, interval_ms: 25)
+
+      wait_until(fn -> not (("__ltx/server/1/" <> orphan) in segment_keys(context, "server/1")) end)
+    end
+
+    test "the supervisor starts a sweeper for an LTX storage backend", context do
+      supervisor_name = :"ltx_sweeper_#{System.unique_integer([:positive, :monotonic])}"
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: supervisor_name,
+           prefix: "ltx_sweeper/",
+           backend:
+             {DurableServer.Backends.LTXStore,
+              [
+                backend: {DurableServer.TestMemoryBackend, context.table},
+                page_size: 512,
+                sweep_interval_ms: 25
+              ]},
+           graceful_shutdown_timeout_ms: 500
+         ]}
+      )
+
+      # Plant an orphan behind a real head written through the supervisor's
+      # backend.
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      {:ok, %{etag: etag}} = StorageBackend.put_object(backend, "ltx_sweeper/k", big_state(1))
+      {:ok, _object} = StorageBackend.put_object(backend, "ltx_sweeper/k", big_state(2), etag: etag)
+
+      orphan = "__ltx/ltx_sweeper/k/0000000000000001-0000000000000001.deadbeef.ltx"
+      :ets.insert(context.table, {{:object, orphan}, %{"junk" => true}, "9"})
+
+      wait_until(fn -> :ets.lookup(context.table, {:object, orphan}) == [] end)
+    end
+
+    test "sweep_interval_ms: :disabled starts no sweeper", context do
+      supervisor_name = :"ltx_no_sweeper_#{System.unique_integer([:positive, :monotonic])}"
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: supervisor_name,
+           prefix: "ltx_no_sweeper/",
+           backend:
+             {DurableServer.Backends.LTXStore,
+              [
+                backend: {DurableServer.TestMemoryBackend, context.table},
+                page_size: 512,
+                sweep_interval_ms: :disabled
+              ]},
+           graceful_shutdown_timeout_ms: 500
+         ]}
+      )
+
+      sweeper_children =
+        supervisor_name
+        |> Supervisor.which_children()
+        |> Enum.filter(&match?({{DurableServer.LTX.Sweeper, _ref}, _pid, _type, _mods}, &1))
+
+      assert sweeper_children == []
+    end
+  end
+
   describe "sweep_orphans/2" do
     test "deletes unreferenced segments the head has advanced past", context do
       assert {:ok, %{etag: etag}} = StorageBackend.put_object(context.store, "server/1", big_state(1))

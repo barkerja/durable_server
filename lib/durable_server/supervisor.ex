@@ -3933,11 +3933,33 @@ defmodule DurableServer.Supervisor do
 
     %{
       backend: backend,
-      managed_children: nested_resource.managed_children,
+      managed_children:
+        nested_resource.managed_children ++ ltx_sweeper_children(backend, role),
       managed?: nested_resource.managed?,
       managed_ekv_child_opts: nested_resource.managed_ekv_child_opts
     }
   end
+
+  # One sweeper per supervisor tree, attached to the storage backend only: a
+  # heartbeat-role LTXStore over the same store would sweep the same __ltx/
+  # namespace redundantly (sweeping is idempotent, so this is an efficiency
+  # choice, not a safety one).
+  defp ltx_sweeper_children(
+         %StorageBackend{state: %{sweep_interval_ms: interval_ms}} = backend,
+         :storage_backend
+       )
+       when is_integer(interval_ms) do
+    [
+      %{
+        id: {DurableServer.LTX.Sweeper, make_ref()},
+        start:
+          {DurableServer.LTX.Sweeper, :start_link,
+           [[backend: backend, interval_ms: interval_ms]]}
+      }
+    ]
+  end
+
+  defp ltx_sweeper_children(_backend, _role), do: []
 
   defp init_backend_resource(spec, finch, task_sup, _role) do
     %{
@@ -4041,6 +4063,28 @@ defmodule DurableServer.Supervisor do
       :error ->
         nil
     end
+  end
+
+  # An LTXStore wrapper is transparent to heartbeat derivation: recurse with
+  # the inner backend substituted, so LTXStore{managed EKV} derives a plain
+  # EKV heartbeat store and LTXStore{EncryptedStore{managed EKV}} derives an
+  # encrypted one. Deliberately, the derived heartbeat store is NOT
+  # LTX-wrapped: unlike encryption there is no security property to carry
+  # forward — heartbeats are tiny, constantly-rewritten values that would
+  # all take the inline path anyway, so LTX-wrapping them buys nothing and
+  # costs head-envelope overhead on every heartbeat write.
+  defp maybe_auto_derive_heartbeat_backend(
+         %{
+           managed?: true,
+           backend: %StorageBackend{
+             adapter: DurableServer.Backends.LTXStore,
+             state: %{backend: %StorageBackend{} = inner_backend}
+           }
+         } = resource,
+         finch,
+         task_sup
+       ) do
+    maybe_auto_derive_heartbeat_backend(%{resource | backend: inner_backend}, finch, task_sup)
   end
 
   defp maybe_auto_derive_heartbeat_backend(_resource, _finch, _task_sup), do: nil

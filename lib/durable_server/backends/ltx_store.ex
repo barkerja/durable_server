@@ -69,16 +69,26 @@ defmodule DurableServer.Backends.LTXStore do
   @format_version 1
   @segment_root "__ltx/"
 
-  @valid_opts [:backend, :page_size, :inline_threshold_pages, :max_segments]
+  @valid_opts [
+    :backend,
+    :page_size,
+    :inline_threshold_pages,
+    :max_segments,
+    :sweep_interval_ms
+  ]
   @default_page_size 4096
   @default_inline_threshold_pages 4
   @default_max_segments 16
+  @default_sweep_interval_ms 21_600_000
   @update_max_retries 5
+  @subscribe_ready_timeout_ms 5_000
+  @unsubscribe_ready_timeout_ms @subscribe_ready_timeout_ms * 2
 
   defstruct backend: nil,
             page_size: @default_page_size,
             inline_threshold_pages: @default_inline_threshold_pages,
             max_segments: @default_max_segments,
+            sweep_interval_ms: @default_sweep_interval_ms,
             cache: nil
 
   @type state :: %__MODULE__{}
@@ -92,6 +102,7 @@ defmodule DurableServer.Backends.LTXStore do
     page_size = Keyword.get(opts, :page_size, @default_page_size)
     inline_threshold_pages = Keyword.get(opts, :inline_threshold_pages, @default_inline_threshold_pages)
     max_segments = Keyword.get(opts, :max_segments, @default_max_segments)
+    sweep_interval_ms = Keyword.get(opts, :sweep_interval_ms, @default_sweep_interval_ms)
 
     cond do
       not match?(%StorageBackend{}, backend) ->
@@ -108,6 +119,11 @@ defmodule DurableServer.Backends.LTXStore do
       not (is_integer(max_segments) and max_segments >= 1) ->
         raise ArgumentError, "ltx backend :max_segments must be a positive integer"
 
+      not ((is_integer(sweep_interval_ms) and sweep_interval_ms > 0) or
+               sweep_interval_ms == :disabled) ->
+        raise ArgumentError,
+              "ltx backend :sweep_interval_ms must be a positive integer or :disabled"
+
       true ->
         {:ok,
          %{
@@ -116,13 +132,13 @@ defmodule DurableServer.Backends.LTXStore do
              page_size: page_size,
              inline_threshold_pages: inline_threshold_pages,
              max_segments: max_segments,
+             sweep_interval_ms: sweep_interval_ms,
              cache: :ets.new(__MODULE__, [:set, :public])
            },
-           defaults: Map.put(StorageBackend.defaults(backend), :heartbeat_tracking_mode, :poll),
-           features:
-             backend
-             |> StorageBackend.features()
-             |> Map.put(:heartbeat_subscribe?, false)
+           # Heartbeat tracking and subscribe support pass through: subscribe/4
+           # below relays and decodes the wrapped backend's events.
+           defaults: StorageBackend.defaults(backend),
+           features: StorageBackend.features(backend)
          }}
     end
   end
@@ -836,6 +852,132 @@ defmodule DurableServer.Backends.LTXStore do
   rescue
     _error -> :ok
   end
+
+  # -- Subscriptions ----------------------------------------------------------
+
+  # Mirrors EncryptedStore's relay: a spawned relay owns the inner
+  # subscription, decodes storage events, and forwards them to the
+  # subscriber. Events for segment objects (under __ltx/) are dropped —
+  # subscribers observe logical keys only — and marked head values are
+  # restored before forwarding. The event path never writes to the image
+  # cache: events carry no etag, and a bogus-etag entry would displace a
+  # good one.
+
+  @impl true
+  def subscribe(%__MODULE__{} = state, subscriber, prefix, opts) do
+    caller = self()
+
+    relay_pid =
+      spawn(fn ->
+        subscription_relay_init(caller, subscriber, state, prefix, opts)
+      end)
+
+    monitor_ref = Process.monitor(relay_pid)
+
+    receive do
+      {:ltx_store_subscribed, ^relay_pid, {:ok, inner_ref}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, {relay_pid, inner_ref}}
+
+      {:ltx_store_subscribed, ^relay_pid, {:error, reason}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^relay_pid, reason} ->
+        {:error, {:subscription_exit, reason}}
+    after
+      @subscribe_ready_timeout_ms ->
+        abandon_subscribe(state, relay_pid, monitor_ref)
+    end
+  end
+
+  @impl true
+  def unsubscribe(%__MODULE__{} = _state, {relay_pid, inner_ref}) when is_pid(relay_pid) do
+    if Process.alive?(relay_pid) do
+      ref = make_ref()
+      send(relay_pid, {:ltx_store_unsubscribe, self(), ref, inner_ref})
+
+      receive do
+        {:ltx_store_unsubscribed, ^ref} -> :ok
+      after
+        @unsubscribe_ready_timeout_ms -> {:error, :unsubscribe_timeout}
+      end
+    else
+      :ok
+    end
+  end
+
+  def unsubscribe(%__MODULE__{} = _state, _subscription_ref), do: :ok
+
+  # See EncryptedStore.abandon_subscribe/3: a final non-blocking drain
+  # catches a ready message racing the timeout, so the inner subscription is
+  # torn down here rather than leaked when the relay is killed.
+  defp abandon_subscribe(state, relay_pid, monitor_ref) do
+    receive do
+      {:ltx_store_subscribed, ^relay_pid, {:ok, inner_ref}} ->
+        _ = StorageBackend.unsubscribe(state.backend, inner_ref)
+
+      {:ltx_store_subscribed, ^relay_pid, {:error, _reason}} ->
+        :ok
+    after
+      0 -> :ok
+    end
+
+    Process.demonitor(monitor_ref, [:flush])
+    Process.exit(relay_pid, :kill)
+    {:error, :subscribe_timeout}
+  end
+
+  defp subscription_relay_init(caller, subscriber, state, prefix, opts) do
+    monitor_ref = Process.monitor(subscriber)
+
+    case StorageBackend.subscribe(state.backend, self(), prefix, opts) do
+      {:ok, inner_ref} ->
+        send(caller, {:ltx_store_subscribed, self(), {:ok, inner_ref}})
+        subscription_relay_loop(subscriber, state, inner_ref, monitor_ref)
+
+      {:error, reason} ->
+        send(caller, {:ltx_store_subscribed, self(), {:error, reason}})
+    end
+  end
+
+  defp subscription_relay_loop(subscriber, state, inner_ref, monitor_ref) do
+    receive do
+      {:durable_server_storage_events, events} when is_list(events) ->
+        decoded_events = Enum.flat_map(events, &decode_event(state, &1))
+
+        if decoded_events != [] do
+          send(subscriber, {:durable_server_storage_events, decoded_events})
+        end
+
+        subscription_relay_loop(subscriber, state, inner_ref, monitor_ref)
+
+      {:ltx_store_unsubscribe, caller, ref, ^inner_ref} ->
+        _ = StorageBackend.unsubscribe(state.backend, inner_ref)
+        send(caller, {:ltx_store_unsubscribed, ref})
+
+      {:DOWN, ^monitor_ref, :process, ^subscriber, _reason} ->
+        _ = StorageBackend.unsubscribe(state.backend, inner_ref)
+        :ok
+
+      _other ->
+        subscription_relay_loop(subscriber, state, inner_ref, monitor_ref)
+    end
+  end
+
+  defp decode_event(_state, %{key: @segment_root <> _rest}), do: []
+
+  defp decode_event(state, %{key: key, value: %{@head_marker => _version} = head} = event)
+       when is_binary(key) do
+    with {:ok, image, _txid, _manifest} <- restore_image(state, key, head),
+         {:ok, term} <- PagedTerm.decode(image) do
+      [%{event | value: term}]
+    else
+      {:error, _reason} -> []
+    end
+  end
+
+  defp decode_event(_state, event), do: [event]
 
   # -- Ambiguous conditional-write recovery ----------------------------------
 

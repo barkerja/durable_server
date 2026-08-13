@@ -5,14 +5,23 @@ defmodule DurableServer.LTX.LZ4 do
   #
   # The decompressor is a full implementation of the block spec, since it must
   # read blocks produced by any conforming compressor (Go's pierrec/lz4 in
-  # practice). The compressor intentionally emits a single literals-only
-  # sequence: that is always a valid LZ4 block that any decoder — including
-  # Go's — inflates correctly, at the cost of no compression (output is
-  # slightly larger than input: 1 token byte plus one length byte per 255
-  # literals). Real match-finding is deferred to the M3 benchmark milestone;
-  # correctness and interop come first.
+  # practice). The compressor is a greedy single-pass matcher: each 4-byte
+  # substring is used directly as a map key mapping to its last-seen position
+  # (the map is the hash table, collision-free by construction), matches are
+  # extended with the :binary.longest_common_prefix/1 BIF, and the block
+  # format's end rules are honored — no match starts within 12 bytes of the
+  # end, no match extends into the last 5 bytes, and the final sequence is
+  # literals-only. Incompressible input degrades to the literals-only block
+  # that earlier versions always emitted, so compression never fails.
 
   import Bitwise
+
+  @min_match 4
+  @max_offset 65_535
+  # A match may not start within 12 bytes of the end of the block.
+  @match_start_margin 12
+  # A match may not extend into the last 5 bytes of the block.
+  @last_literals 5
 
   @doc """
   Compresses `data` into an LZ4 block. Never fails for non-empty input.
@@ -21,15 +30,84 @@ defmodule DurableServer.LTX.LZ4 do
   def compress_block(data) when is_binary(data) and byte_size(data) > 0 do
     length = byte_size(data)
 
-    if length < 15 do
-      <<length <<< 4, data::binary>>
+    if length < @match_start_margin + 1 do
+      IO.iodata_to_binary(emit_literals(data, 0, length))
     else
-      <<0xF0, encode_extended_length(length - 15)::binary, data::binary>>
+      compress(data, length, 0, 0, %{}, [])
     end
   end
 
-  defp encode_extended_length(n) when n >= 255, do: <<255, encode_extended_length(n - 255)::binary>>
-  defp encode_extended_length(n), do: <<n>>
+  # pos walks the input; anchor marks the start of pending literals.
+  defp compress(data, length, pos, anchor, table, acc) when pos <= length - @match_start_margin do
+    key = binary_part(data, pos, @min_match)
+
+    case table do
+      %{^key => candidate} when pos - candidate <= @max_offset ->
+        table = Map.put(table, key, pos)
+        max_match = length - @last_literals - pos
+
+        # Comparing the two source regions directly also handles overlapping
+        # matches (offset < length): the prefix length of data[candidate..]
+        # vs data[pos..] is exactly the run the decoder will reproduce.
+        match_length =
+          :binary.longest_common_prefix([
+            binary_part(data, pos, max_match),
+            binary_part(data, candidate, max_match)
+          ])
+
+        if match_length >= @min_match do
+          sequence =
+            emit_sequence(data, anchor, pos - anchor, pos - candidate, match_length)
+
+          compress(data, length, pos + match_length, pos + match_length, table, [
+            acc | sequence
+          ])
+        else
+          compress(data, length, pos + 1, anchor, table, acc)
+        end
+
+      _no_usable_candidate ->
+        compress(data, length, pos + 1, anchor, Map.put(table, key, pos), acc)
+    end
+  end
+
+  defp compress(data, length, _pos, anchor, _table, acc) do
+    IO.iodata_to_binary([acc | emit_literals(data, anchor, length - anchor)])
+  end
+
+  # Final literals-only sequence (may be empty only if the whole block was
+  # consumed by matches, which the end rules prevent: the last 5 bytes are
+  # always literals).
+  defp emit_literals(data, offset, count) do
+    token_literals = min(count, 15)
+
+    [
+      <<token_literals <<< 4>>,
+      extended_length(count, 15),
+      binary_part(data, offset, count)
+    ]
+  end
+
+  defp emit_sequence(data, literal_offset, literal_count, offset, match_length) do
+    extra = match_length - @min_match
+    token = bor(min(literal_count, 15) <<< 4, min(extra, 15))
+
+    [
+      <<token>>,
+      extended_length(literal_count, 15),
+      binary_part(data, literal_offset, literal_count),
+      <<offset::16-little>>,
+      extended_length(extra, 15)
+    ]
+  end
+
+  # Emits the extension bytes for a length field whose nibble maxes at
+  # `base`; nothing when the value fits in the nibble.
+  defp extended_length(value, base) when value < base, do: []
+  defp extended_length(value, base), do: encode_extended_length(value - base)
+
+  defp encode_extended_length(n) when n >= 255, do: [255 | encode_extended_length(n - 255)]
+  defp encode_extended_length(n), do: [n]
 
   @doc """
   Decompresses an LZ4 block, requiring the output to be exactly

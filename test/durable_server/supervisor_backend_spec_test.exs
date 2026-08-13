@@ -226,6 +226,105 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert object_store == nil
   end
 
+  test "derives a plain EKV heartbeat store through an LTX wrapper over managed EKV" do
+    supervisor_name = unique_supervisor_name("ltx_ekv_hb")
+    prefix = unique_prefix("ltx_ekv_hb")
+    ekv_name = :"ltx_ekv_hb_#{System.unique_integer([:positive, :monotonic])}"
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend:
+           {DurableServer.Backends.LTXStore,
+            [
+              backend:
+                {EKVStore,
+                 [
+                   name: ekv_name,
+                   data_dir: "/tmp/unused_stub_ekv",
+                   cluster_size: 1,
+                   node_id: 1,
+                   log: false,
+                   ekv_mod: DurableServer.StubEKV,
+                   ekv_supervisor_mod: DurableServer.StubEKV.Config
+                 ]},
+              page_size: 512,
+              sweep_interval_ms: :disabled
+            ]},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert config.storage_backend.adapter == DurableServer.Backends.LTXStore
+    assert config.storage_backend.state.backend.adapter == EKVStore
+
+    # The LTX wrapper is transparent to heartbeat derivation, and the derived
+    # store is deliberately NOT LTX-wrapped (heartbeats gain nothing from
+    # segment form).
+    assert config.heartbeat_backend.adapter == EKVStore
+    assert config.heartbeat_backend.state.name == :"#{ekv_name}_heartbeats"
+
+    # Both managed stub EKV instances are supervised and running.
+    assert Process.whereis(:"#{ekv_name}_ekv_sup") != nil
+    assert Process.whereis(:"#{ekv_name}_heartbeats_ekv_sup") != nil
+  end
+
+  test "derives an encrypted heartbeat store through an LTX wrapper over encrypted managed EKV" do
+    supervisor_name = unique_supervisor_name("ltx_enc_ekv_hb")
+    prefix = unique_prefix("ltx_enc_ekv_hb")
+    ekv_name = :"ltx_enc_ekv_hb_#{System.unique_integer([:positive, :monotonic])}"
+    {public_key, private_key} = Encryption.generate_key_pair()
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend:
+           {DurableServer.Backends.LTXStore,
+            [
+              backend:
+                {EncryptedStore,
+                 [
+                   backend:
+                     {EKVStore,
+                      [
+                        name: ekv_name,
+                        data_dir: "/tmp/unused_stub_ekv",
+                        cluster_size: 1,
+                        node_id: 1,
+                        log: false,
+                        ekv_mod: DurableServer.StubEKV,
+                        ekv_supervisor_mod: DurableServer.StubEKV.Config
+                      ]},
+                   recipient_public_keys: [public_key],
+                   decryption_key: private_key,
+                   plaintext_compat: :strict
+                 ]},
+              page_size: 512,
+              sweep_interval_ms: :disabled
+            ]},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert config.storage_backend.adapter == DurableServer.Backends.LTXStore
+    assert config.storage_backend.state.backend.adapter == EncryptedStore
+
+    # Delegation preserves the security property: heartbeats stay encrypted
+    # without being LTX-wrapped, carrying plaintext_compat forward.
+    assert config.heartbeat_backend.adapter == EncryptedStore
+    assert config.heartbeat_backend.state.backend.adapter == EKVStore
+    assert config.heartbeat_backend.state.backend.state.name == :"#{ekv_name}_heartbeats"
+    assert config.heartbeat_backend.state.plaintext_compat == :strict
+  end
+
   test "caps placement ERPC timeout by the caller deadline" do
     supervisor_name = unique_supervisor_name("placement_deadline")
     prefix = unique_prefix("placement_deadline")

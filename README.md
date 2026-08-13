@@ -347,9 +347,12 @@ all verified, and anything inconsistent fails closed with an error — never
 key and silently overwritten. Objects written before LTXStore was introduced
 read through unchanged and convert to segment form on their next write.
 
-A lost head CAS can leave an orphan segment no manifest references. Sweep
-them periodically (from a cron job or operator console — it is safe to run
-anywhere, anytime, concurrently with live traffic):
+A lost head CAS can leave an orphan segment no manifest references. The
+supervisor automatically runs `DurableServer.LTX.Sweeper` against an LTX
+storage backend every `:sweep_interval_ms` (default 6 hours, jittered across
+the fleet; pass `:disabled` to opt out). Sweeping is idempotent and safe to
+run from any node at any time, concurrently with live traffic, so you can
+also invoke it manually:
 
 ```elixir
 %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(MyDurableSup)
@@ -375,8 +378,17 @@ Note the encrypted backend's 16 MiB payload bound applies per sealed object,
 which caps practical state size around 10 MiB for this composition
 (segment bytes carry base64 overhead through the wrapped codec).
 
-Known limits: storage subscriptions are not supported (heartbeat tracking
-falls back to `:poll`), child keys must not live under the reserved `__ltx/`
+Storage subscriptions relay through the wrapper: subscribers observe logical
+keys with decoded values, segment traffic under `__ltx/` is invisible to
+them, and the wrapped backend's heartbeat tracking mode passes through — so
+an LTX-wrapped EKV backend keeps subscribe-based heartbeats. Wrapping a
+*managed* EKV backend (`data_dir`/`cluster_size`/`node_id`) also derives the
+split heartbeat store automatically; the derived store is deliberately not
+LTX-wrapped (heartbeats are tiny, constantly-rewritten values that gain
+nothing from segment form), while an encrypted layer under the LTX wrapper
+is carried forward so heartbeats stay encrypted.
+
+Known limits: child keys must not live under the reserved `__ltx/`
 namespace, encoded states are capped at 1 GiB, and delta efficiency depends
 on byte-stable mutations — a length-changing edit early in the encoded term
 shifts every later page and degrades that sync toward full-snapshot cost

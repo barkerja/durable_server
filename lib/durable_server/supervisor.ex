@@ -3918,6 +3918,27 @@ defmodule DurableServer.Supervisor do
     }
   end
 
+  defp init_backend_resource(
+         {DurableServer.Backends.LTXStore, raw_opts},
+         finch,
+         task_sup,
+         role
+       ) do
+    ltx_opts = normalize_backend_opts(raw_opts)
+    nested_spec = Keyword.fetch!(ltx_opts, :backend)
+    nested_resource = init_backend_resource(nested_spec, finch, task_sup, role)
+
+    backend_opts = Keyword.put(ltx_opts, :backend, nested_resource.backend)
+    backend = init_backend!(DurableServer.Backends.LTXStore, backend_opts)
+
+    %{
+      backend: backend,
+      managed_children: nested_resource.managed_children,
+      managed?: nested_resource.managed?,
+      managed_ekv_child_opts: nested_resource.managed_ekv_child_opts
+    }
+  end
+
   defp init_backend_resource(spec, finch, task_sup, _role) do
     %{
       backend: init_backend_spec(spec, finch, task_sup),
@@ -4111,6 +4132,17 @@ defmodule DurableServer.Supervisor do
     encryption_opts = normalize_backend_opts(raw_opts)
     backend = encryption_opts |> Keyword.fetch!(:backend) |> init_backend_spec(finch, task_sup)
     Keyword.put(encryption_opts, :backend, backend)
+  end
+
+  defp prepare_backend_init_opts(
+         DurableServer.Backends.LTXStore,
+         raw_opts,
+         finch,
+         task_sup
+       ) do
+    ltx_opts = normalize_backend_opts(raw_opts)
+    backend = ltx_opts |> Keyword.fetch!(:backend) |> init_backend_spec(finch, task_sup)
+    Keyword.put(ltx_opts, :backend, backend)
   end
 
   defp prepare_backend_init_opts(DurableServer.Backends.MirrorStore, raw_opts, finch, task_sup) do

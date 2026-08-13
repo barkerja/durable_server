@@ -197,6 +197,35 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert object_store == nil
   end
 
+  test "accepts a nested backend module spec in ltx store" do
+    supervisor_name = unique_supervisor_name("ltx")
+    prefix = unique_prefix("ltx")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend:
+           {DurableServer.Backends.LTXStore,
+            [
+              backend: {InMemoryBackend, name: :ltx_nested},
+              page_size: 512
+            ]},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    %{storage_backend: storage_backend, object_store: object_store} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert storage_backend.adapter == DurableServer.Backends.LTXStore
+    assert storage_backend.state.backend.adapter == InMemoryBackend
+    assert storage_backend.state.backend.state.name == :ltx_nested
+    assert storage_backend.state.page_size == 512
+    assert object_store == nil
+  end
+
   test "caps placement ERPC timeout by the caller deadline" do
     supervisor_name = unique_supervisor_name("placement_deadline")
     prefix = unique_prefix("placement_deadline")

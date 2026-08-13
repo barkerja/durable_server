@@ -303,11 +303,48 @@ key, for example via `list_all_objects_stream`) before step 3 is safe.
 
 Wrap any backend with `DurableServer.Backends.LTXStore` to persist each key
 as a log of [LTX](https://github.com/superfly/ltx) segments instead of one
-full-state object — the persistence model Litestream uses for
-SQLite, applied to DurableServer state. A sync then writes only the pages of
-the encoded state that actually changed, which matters for large states:
+full-state object — the persistence model Litestream uses for SQLite,
+applied to DurableServer state. A sync then writes only the pages of the
+encoded state that actually changed, which matters for large states:
 benchmarked point mutations of a 1 MiB state write ~3% of the full-state
 bytes, and appends under 1%.
+
+#### When to use it — and when not to
+
+LTXStore pays off when these hold:
+
+- **States are large** (tens of KiB to hundreds of MiB encoded). Below the
+  inline threshold (16 KiB by default) it behaves exactly like the plain
+  backend, so it is harmless — but also pointless — for uniformly tiny
+  states.
+- **Syncs are frequent relative to state size.** The win is per-sync bytes;
+  a server that syncs once at shutdown gains little.
+- **Mutations are byte-stable.** Appending to logs/queues, updating
+  fixed-size fields, or touching a few entries of a large map all produce
+  small deltas. A length-changing edit early in the encoded term shifts
+  every later page and degrades that sync toward full-snapshot cost — never
+  *worse* than the plain backend's every-sync full write, but no better.
+- **You can spare the read amplification.** A cold restore fetches the head
+  plus up to `:max_segments` objects instead of one. Rehome and cold-start
+  latency grows accordingly (bounded by snapshot resets).
+
+Prefer the plain backend when:
+
+- states are small (session stubs, counters, presence records) — the inline
+  path makes LTXStore equivalent, so the extra moving parts buy nothing;
+- you rely on **inspecting stored JSON** in the bucket — LTX heads and
+  segments are opaque envelopes, not human-readable state (the trade that
+  buys full term fidelity: atom keys, pids, and refs survive);
+- your mutation pattern is a wholesale state replacement each sync — every
+  delta would be a full rewrite plus segment overhead;
+- you need rock-bottom operational surface: one object per key, no
+  manifests, no sweeper.
+
+#### Usage
+
+Configuration is one wrapper in the supervisor spec — server modules,
+`dump_state/1`/`load_state/2`, and every `DurableServer.Supervisor` API are
+completely unchanged:
 
 ```elixir
 children = [
@@ -319,6 +356,59 @@ children = [
       backend: {DurableServer.Backends.ObjectStore, object_store_opts}}}
 ]
 ```
+
+A representative server — a document holding a large body plus append-only
+history, the ideal delta shape:
+
+```elixir
+defmodule MyApp.DocumentServer do
+  use DurableServer, vsn: 1
+
+  def dump_state(state), do: state
+  def load_state(_old_vsn, persisted), do: persisted
+
+  def init(state, _info), do: {:ok, state, auto_sync: true, sync_every_ms: 5_000}
+
+  def handle_call({:edit, patch}, _from, state) do
+    state =
+      state
+      |> Map.update!(:body, &apply_patch(&1, patch))
+      |> Map.update!(:history, &[patch | &1])
+
+    {:reply, :ok, state, :sync}
+  end
+end
+
+DurableServer.Supervisor.ensure_started_child(
+  MyDurableSup,
+  {MyApp.DocumentServer, key: "doc_42", initial_state: %{body: "", history: []}}
+)
+```
+
+With a 1 MiB body, each edit syncs a delta segment of roughly the touched
+pages (a few KiB) instead of re-uploading the full megabyte; every ~16th
+sync writes a fresh snapshot and resets the log.
+
+Options (all set on the `LTXStore` spec):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `:backend` | required | The wrapped, transport-providing backend spec |
+| `:page_size` | `4096` | LTX page size; power of two, 512–65536 |
+| `:inline_threshold_pages` | `4` | States at or below this many pages embed in the head (one PUT) |
+| `:max_segments` | `16` | Manifest length that triggers a snapshot reset |
+| `:sweep_interval_ms` | `21_600_000` (6 h) | Automatic orphan-sweep interval; `:disabled` opts out |
+
+#### Migrating an existing deployment
+
+Switching an existing prefix to LTXStore is in-place: objects written before
+the wrapper read through unchanged and convert to LTX form on their next
+write. Rolling back is the reverse migration *only for keys still in inline
+or legacy form* — once a key has segment form, the plain backend cannot read
+it, so treat the cutover as forward-only (or run a `MirrorStore` phase
+first, as with any backend migration).
+
+#### How it stores data
 
 The object at the key itself remains the **head**: it carries the current
 transaction id, rolling checksum, and segment manifest, and it is the sole
@@ -388,11 +478,23 @@ LTX-wrapped (heartbeats are tiny, constantly-rewritten values that gain
 nothing from segment form), while an encrypted layer under the LTX wrapper
 is carried forward so heartbeats stay encrypted.
 
+#### Failure modes to expect
+
+- A read of a damaged or partially deleted log returns a descriptive error
+  (`{:segment_restore_failed, name, reason}`,
+  `:restored_checksum_mismatch`, ...) after one retry against a freshly read
+  head, and logs a warning. It never returns `{:error, :not_found}`, so
+  `ensure_started_child/3` will surface the failure instead of starting a
+  fresh child over intact data.
+- A crash between a segment PUT and the head CAS leaves an orphan segment.
+  It is invisible to readers (the manifest defines the log) and the sweeper
+  deletes it once the head has provably advanced past its TXID range.
+- An unchanged state synced with CAS still advances the head (a zero-page
+  segment keeps the transaction chain contiguous), so etag-based fencing
+  behaves exactly as with the plain backend.
+
 Known limits: child keys must not live under the reserved `__ltx/`
-namespace, encoded states are capped at 1 GiB, and delta efficiency depends
-on byte-stable mutations — a length-changing edit early in the encoded term
-shifts every later page and degrades that sync toward full-snapshot cost
-(never worse than the plain backend's every-sync full write).
+namespace, and encoded states are capped at 1 GiB.
 
 ## Configuration Options
 

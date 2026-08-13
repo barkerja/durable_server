@@ -3,8 +3,8 @@ defmodule DurableServer.LTX do
   Reader/writer for the LTX (Lite Transaction File) format, version 3.
 
   LTX is the page-oriented transaction file format from `superfly/ltx`, used
-  by LiteFS/Litestream to ship database state to object
-  storage as immutable, compactable segments. This implementation is
+  by LiteFS and Litestream to ship database state to object storage as
+  immutable, compactable segments. This implementation is
   wire-compatible with the Go reference implementation: files it encodes
   verify under the Go decoder and vice versa.
 

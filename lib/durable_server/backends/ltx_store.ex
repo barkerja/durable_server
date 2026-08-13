@@ -2,8 +2,8 @@ defmodule DurableServer.Backends.LTXStore do
   @moduledoc """
   Storage backend that persists each key as a log of LTX segments instead of
   one full-state object, so a sync writes only the pages of the encoded state
-  that changed — the Litestream persistence model applied to
-  DurableServer state.
+  that changed — the Litestream persistence model applied to DurableServer
+  state.
 
   Configure it with a wrapped backend that provides transport and CAS:
 

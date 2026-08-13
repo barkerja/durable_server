@@ -4,7 +4,7 @@ defmodule DurableServer.LTX.InteropTest do
   import Bitwise
 
   alias DurableServer.LTX
-  alias DurableServer.LTX.{Decoder, Encoder}
+  alias DurableServer.LTX.{Compactor, Decoder, Encoder}
 
   @moduledoc """
   Interop against the Go reference implementation (github.com/superfly/ltx).
@@ -180,6 +180,15 @@ defmodule DurableServer.LTX.InteropTest do
           [{7, page(7, 512)}, {9, page(9, 512)}],
           0
         )
+
+        # A compaction of the snapshot and delta written above.
+        {:ok, compacted} =
+          Compactor.compact([
+            File.read!(Path.join(dir, "elixir_snapshot.ltx")),
+            File.read!(Path.join(dir, "elixir_delta.ltx"))
+          ])
+
+        File.write!(Path.join(dir, "elixir_compacted.ltx"), IO.iodata_to_binary(compacted))
 
         files = Enum.sort(Path.wildcard(Path.join(dir, "*.ltx")))
         assert files != []
